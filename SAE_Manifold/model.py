@@ -1,311 +1,342 @@
+"""
+SAE Lens Manifold-Refined SAE Experiment
+=======================================
+
+This script:
+1. Loads GPT-2 small with TransformerLens.
+2. Loads a pretrained SAE from SAE Lens.
+3. Builds activation datasets from TinyShakespeare and/or TinyStories.
+4. Freezes the SAE.
+5. Trains:
+   - ManifoldRefinedSAE: feature-conditioned local decoder offsets.
+   - ScalarRescaleSAE: scalar-amplitude baseline.
+6. Evaluates reconstruction improvement against the frozen SAE.
+
+Install:
+    pip install torch transformer-lens sae-lens datasets tqdm
+
+Example:
+    python sae_lens_manifold_experiment.py \
+        --dataset tinyshakespeare \
+        --release gpt2-small-res-jb \
+        --sae-id blocks.6.hook_resid_pre \
+        --num-epochs 3 \
+        --max-token-blocks 256
+
+Notes:
+- The SAE is pretrained and frozen.
+- The activations are taken from sae.cfg.hook_name, e.g. blocks.6.hook_resid_pre.
+- For this particular SAE family, d_sae is usually 24576 and d_model is 768.
+"""
+
+import argparse
 import math
+import os
 import urllib.request
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple, List
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
-
-from datasets import load_dataset
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from torch.utils.data import DataLoader, Dataset, random_split
 from tqdm import tqdm
 
+from datasets import load_dataset
+from sae_lens import SAE
+from transformer_lens import HookedTransformer
+
 
 # ============================================================
-# 1. Dataset utilities
+# 0. Utilities
 # ============================================================
+
+
+def get_device() -> str:
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def set_seed(seed: int) -> None:
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def to_float32(x: torch.Tensor) -> torch.Tensor:
+    return x.detach().to(torch.float32)
+
+
+# ============================================================
+# 1. Text loading
+# ============================================================
+
 
 def load_tinyshakespeare_text() -> str:
     url = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
-    text = urllib.request.urlopen(url).read().decode("utf-8")
-    return text
+    with urllib.request.urlopen(url) as f:
+        return f.read().decode("utf-8")
 
 
 def load_tinystories_texts(split: str = "train", max_examples: Optional[int] = None) -> List[str]:
     ds = load_dataset("roneneldan/TinyStories", split=split)
-
     if max_examples is not None:
         ds = ds.select(range(min(max_examples, len(ds))))
-
     return [ex["text"] for ex in ds]
 
 
-class TokenDataset(Dataset):
+def get_texts(dataset: str, max_examples: Optional[int]) -> List[str]:
+    name = dataset.lower()
+    if name in {"tinyshakespeare", "shakespeare"}:
+        return [load_tinyshakespeare_text()]
+    if name in {"tinystories", "tiny_stories", "stories"}:
+        return load_tinystories_texts(split="train", max_examples=max_examples)
+    raise ValueError(f"Unknown dataset: {dataset}")
+
+
+class TokenBlockDataset(Dataset):
     """
-    Converts raw text into fixed-length token blocks.
+    Stores fixed-length token blocks produced by TransformerLens tokenizer.
     """
 
     def __init__(
         self,
-        tokenizer,
+        model: HookedTransformer,
         texts: List[str],
-        seq_len: int = 128,
+        seq_len: int,
         max_tokens: Optional[int] = None,
     ):
-        self.tokenizer = tokenizer
         self.seq_len = seq_len
+        token_chunks: List[torch.Tensor] = []
+        total = 0
 
-        all_ids = []
-
-        for text in tqdm(texts, desc="Tokenizing texts"):
-            ids = tokenizer.encode(text, add_special_tokens=False)
-            all_ids.extend(ids)
-
-            if max_tokens is not None and len(all_ids) >= max_tokens:
-                all_ids = all_ids[:max_tokens]
+        for text in tqdm(texts, desc="Tokenizing"):
+            # prepend_bos=False keeps the dataset close to ordinary raw-token blocks.
+            toks = model.to_tokens(text, prepend_bos=False).squeeze(0).cpu()
+            token_chunks.append(toks)
+            total += toks.numel()
+            if max_tokens is not None and total >= max_tokens:
                 break
 
-        n_blocks = len(all_ids) // seq_len
-        all_ids = all_ids[: n_blocks * seq_len]
+        all_tokens = torch.cat(token_chunks, dim=0)
+        if max_tokens is not None:
+            all_tokens = all_tokens[:max_tokens]
 
-        self.tokens = torch.tensor(all_ids, dtype=torch.long).view(n_blocks, seq_len)
+        n_blocks = all_tokens.numel() // seq_len
+        all_tokens = all_tokens[: n_blocks * seq_len]
+        self.tokens = all_tokens.view(n_blocks, seq_len).long()
 
-    def __len__(self):
+        if len(self.tokens) == 0:
+            raise ValueError("No token blocks were created. Increase max_tokens or reduce seq_len.")
+
+    def __len__(self) -> int:
         return self.tokens.shape[0]
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int) -> torch.Tensor:
         return self.tokens[idx]
 
 
-def make_text_dataloader(
-    dataset_name: str,
-    tokenizer,
-    split: str = "train",
-    seq_len: int = 128,
-    batch_size: int = 16,
-    max_examples: Optional[int] = None,
-    max_tokens: Optional[int] = None,
-    shuffle: bool = True,
-):
-    if dataset_name.lower() in ["tinyshakespeare", "shakespeare"]:
-        text = load_tinyshakespeare_text()
-        texts = [text]
+# ============================================================
+# 2. Activation dataset through TransformerLens cache
+# ============================================================
 
-    elif dataset_name.lower() in ["tinystories", "tiny_stories"]:
-        texts = load_tinystories_texts(split=split, max_examples=max_examples)
 
-    else:
-        raise ValueError(f"Unknown dataset: {dataset_name}")
+class ActivationDataset(Dataset):
+    """
+    Materializes activations from one hook point into memory.
 
-    dataset = TokenDataset(
-        tokenizer=tokenizer,
+    For larger experiments, replace this with a streaming buffer.
+    For a first experiment, materializing is simpler and safer.
+    """
+
+    def __init__(
+        self,
+        tl_model: HookedTransformer,
+        token_dataset: TokenBlockDataset,
+        hook_name: str,
+        token_batch_size: int,
+        device: str,
+        max_token_blocks: Optional[int] = None,
+        token_position: str = "all",
+    ):
+        self.activations: torch.Tensor
+        self.hook_name = hook_name
+        self.token_position = token_position
+
+        if max_token_blocks is not None:
+            n = min(max_token_blocks, len(token_dataset))
+            token_dataset = torch.utils.data.Subset(token_dataset, range(n))
+
+        token_loader = DataLoader(
+            token_dataset,
+            batch_size=token_batch_size,
+            shuffle=False,
+            drop_last=False,
+        )
+
+        acts_cpu: List[torch.Tensor] = []
+        tl_model.eval()
+
+        with torch.no_grad():
+            for tokens in tqdm(token_loader, desc=f"Caching activations at {hook_name}"):
+                tokens = tokens.to(device)
+                _, cache = tl_model.run_with_cache(tokens, names_filter=[hook_name])
+                acts = cache[hook_name]
+
+                # Expected shape: [batch, seq_len, d_model]
+                if token_position == "all":
+                    acts = acts.reshape(-1, acts.shape[-1])
+                elif token_position == "last":
+                    acts = acts[:, -1, :]
+                elif token_position.startswith("index:"):
+                    idx = int(token_position.split(":", 1)[1])
+                    acts = acts[:, idx, :]
+                else:
+                    raise ValueError(f"Unknown token_position: {token_position}")
+
+                acts_cpu.append(to_float32(acts).cpu())
+
+        self.activations = torch.cat(acts_cpu, dim=0)
+
+    def __len__(self) -> int:
+        return self.activations.shape[0]
+
+    def __getitem__(self, idx: int) -> torch.Tensor:
+        return self.activations[idx]
+
+
+def make_activation_loaders(
+    tl_model: HookedTransformer,
+    dataset: str,
+    hook_name: str,
+    seq_len: int,
+    token_batch_size: int,
+    activation_batch_size: int,
+    device: str,
+    max_examples: Optional[int],
+    max_tokens: Optional[int],
+    max_token_blocks: Optional[int],
+    val_fraction: float,
+    seed: int,
+) -> Tuple[DataLoader, DataLoader]:
+    texts = get_texts(dataset, max_examples=max_examples)
+    token_dataset = TokenBlockDataset(
+        model=tl_model,
         texts=texts,
         seq_len=seq_len,
         max_tokens=max_tokens,
     )
 
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        drop_last=True,
-    )
-
-    return loader
-
-
-# ============================================================
-# 2. Activation extraction
-# ============================================================
-
-class ActivationBuffer:
-    """
-    Collects activations from a specified transformer block.
-
-    This version is written for GPT-like HuggingFace models where the blocks live at:
-        model.transformer.h[layer_idx]
-
-    For other models, modify get_layer().
-    """
-
-    def __init__(
-        self,
-        model: nn.Module,
-        layer_idx: int,
-        device: str = "cuda",
-        token_position: str = "all",
-    ):
-        self.model = model
-        self.layer_idx = layer_idx
-        self.device = device
-        self.token_position = token_position
-        self.cached_activation = None
-        self.hook_handle = None
-
-    def get_layer(self):
-        # GPT-2 style.
-        if hasattr(self.model, "transformer") and hasattr(self.model.transformer, "h"):
-            return self.model.transformer.h[self.layer_idx]
-
-        # Pythia / GPT-NeoX style.
-        if hasattr(self.model, "gpt_neox") and hasattr(self.model.gpt_neox, "layers"):
-            return self.model.gpt_neox.layers[self.layer_idx]
-
-        # LLaMA style.
-        if hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
-            return self.model.model.layers[self.layer_idx]
-
-        raise ValueError("Unknown model architecture. Modify ActivationBuffer.get_layer().")
-
-    def hook_fn(self, module, inputs, output):
-        # Many HF blocks return either tensor or tuple.
-        if isinstance(output, tuple):
-            act = output[0]
-        else:
-            act = output
-
-        # act: [batch, seq_len, d_model]
-        self.cached_activation = act.detach()
-
-    def __enter__(self):
-        layer = self.get_layer()
-        self.hook_handle = layer.register_forward_hook(self.hook_fn)
-        return self
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        if self.hook_handle is not None:
-            self.hook_handle.remove()
-
-    @torch.no_grad()
-    def get_activations(self, input_ids: torch.Tensor):
-        self.cached_activation = None
-
-        input_ids = input_ids.to(self.device)
-
-        _ = self.model(input_ids)
-
-        acts = self.cached_activation
-
-        if acts is None:
-            raise RuntimeError("Hook failed to capture activations.")
-
-        # acts: [batch, seq_len, d_model]
-        if self.token_position == "all":
-            acts = acts.reshape(-1, acts.shape[-1])
-
-        elif self.token_position == "last":
-            acts = acts[:, -1, :]
-
-        elif isinstance(self.token_position, int):
-            acts = acts[:, self.token_position, :]
-
-        else:
-            raise ValueError(f"Unknown token_position: {self.token_position}")
-
-        return acts
-
-
-class ActivationDataset(Dataset):
-    """
-    Materializes activations into memory.
-
-    For large experiments, you should stream activations instead.
-    This is for a first pilot.
-    """
-
-    def __init__(
-        self,
-        model,
-        token_loader,
-        layer_idx: int,
-        device: str = "cuda",
-        token_position: str = "all",
-        max_activation_batches: Optional[int] = None,
-    ):
-        self.activations = []
-
-        model.eval()
-        model.to(device)
-
-        with ActivationBuffer(
-            model=model,
-            layer_idx=layer_idx,
-            device=device,
-            token_position=token_position,
-        ) as buffer:
-            for batch_idx, input_ids in enumerate(tqdm(token_loader, desc="Collecting activations")):
-                if max_activation_batches is not None and batch_idx >= max_activation_batches:
-                    break
-
-                acts = buffer.get_activations(input_ids)
-                self.activations.append(acts.cpu())
-
-        self.activations = torch.cat(self.activations, dim=0)
-
-    def __len__(self):
-        return self.activations.shape[0]
-
-    def __getitem__(self, idx):
-        return self.activations[idx]
-
-
-def make_activation_loader(
-    model,
-    token_loader,
-    layer_idx: int,
-    activation_batch_size: int = 1024,
-    device: str = "cuda",
-    token_position: str = "all",
-    max_activation_batches: Optional[int] = None,
-    shuffle: bool = True,
-):
-    dataset = ActivationDataset(
-        model=model,
-        token_loader=token_loader,
-        layer_idx=layer_idx,
+    act_dataset = ActivationDataset(
+        tl_model=tl_model,
+        token_dataset=token_dataset,
+        hook_name=hook_name,
+        token_batch_size=token_batch_size,
         device=device,
-        token_position=token_position,
-        max_activation_batches=max_activation_batches,
+        max_token_blocks=max_token_blocks,
+        token_position="all",
     )
 
-    loader = DataLoader(
-        dataset,
+    n_val = max(1, int(len(act_dataset) * val_fraction))
+    n_train = len(act_dataset) - n_val
+    generator = torch.Generator().manual_seed(seed)
+    train_set, val_set = random_split(act_dataset, [n_train, n_val], generator=generator)
+
+    train_loader = DataLoader(
+        train_set,
         batch_size=activation_batch_size,
-        shuffle=shuffle,
+        shuffle=True,
         drop_last=True,
     )
+    val_loader = DataLoader(
+        val_set,
+        batch_size=activation_batch_size,
+        shuffle=False,
+        drop_last=False,
+    )
 
-    return loader
+    return train_loader, val_loader
 
 
 # ============================================================
-# 3. Manifold-refined SAE
+# 3. SAE wrapper
 # ============================================================
+
+
+class FrozenSAEWrapper(nn.Module):
+    """
+    Small compatibility wrapper.
+
+    The rest of this script expects:
+        encode(x) -> sparse feature activations
+        decode(f) -> reconstruction
+        W_dec: [d_sae, d_model]
+        b_dec: [d_model]
+
+    SAE Lens exposes these for standard pretrained SAEs.
+    """
+
+    def __init__(self, sae: SAE):
+        super().__init__()
+        self.sae = sae
+
+        for p in self.sae.parameters():
+            p.requires_grad = False
+
+    @property
+    def W_dec(self) -> torch.Tensor:
+        return self.sae.W_dec
+
+    @property
+    def b_dec(self) -> torch.Tensor:
+        # Most SAE Lens SAEs expose b_dec. This fallback makes failures clearer.
+        if not hasattr(self.sae, "b_dec"):
+            raise AttributeError("This SAE object does not expose b_dec.")
+        return self.sae.b_dec
+
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        return self.sae.encode(x)
+
+    def decode(self, f: torch.Tensor) -> torch.Tensor:
+        if hasattr(self.sae, "decode"):
+            return self.sae.decode(f)
+        return self.b_dec + f @ self.W_dec
+
+
+# ============================================================
+# 4. Manifold-refined SAE
+# ============================================================
+
 
 @dataclass
 class ManifoldSAEConfig:
     d_model: int
-    n_features: int
+    d_sae: int
     top_k: int = 32
     rank: int = 4
     hidden_dim: int = 256
-
     lambda_delta: float = 1e-3
     lambda_z: float = 1e-4
     lambda_parallel: float = 1e-3
-
     normalize_decoder: bool = False
 
 
 class OffsetMLP(nn.Module):
     """
-    Predicts z_i(x), the low-dimensional local coordinate
-    for active feature i.
+    Predicts low-dimensional coordinates z_i(x) for each active feature.
 
-    Input per active feature:
-        [f_i, v_i, x_hat_sae]
-
+    Per active feature input:
+        [feature_activation, decoder_vector, sae_reconstruction]
     Output:
         z_i in R^rank
     """
 
     def __init__(self, d_model: int, rank: int, hidden_dim: int):
         super().__init__()
-
         in_dim = 1 + d_model + d_model
-
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
             nn.GELU(),
@@ -313,8 +344,6 @@ class OffsetMLP(nn.Module):
             nn.GELU(),
             nn.Linear(hidden_dim, rank),
         )
-
-        # Make initial correction close to zero.
         nn.init.zeros_(self.net[-1].weight)
         nn.init.zeros_(self.net[-1].bias)
 
@@ -324,39 +353,26 @@ class OffsetMLP(nn.Module):
         v_active: torch.Tensor,
         x_hat_sae: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        f_active: [batch, k]
-        v_active: [batch, k, d_model]
-        x_hat_sae: [batch, d_model]
-
-        returns:
-            z: [batch, k, rank]
-        """
-
         batch, k, d_model = v_active.shape
-
         x_context = x_hat_sae[:, None, :].expand(batch, k, d_model)
         f_context = f_active[..., None]
-
         inp = torch.cat([f_context, v_active, x_context], dim=-1)
-
         return self.net(inp)
 
 
 class ManifoldRefinedSAE(nn.Module):
     """
-    Frozen SAE plus feature-conditioned low-rank manifold offsets.
+    Frozen SAE plus feature-conditioned low-rank local offsets.
 
-    Standard SAE:
-        x_hat_sae = b + sum_i f_i(x) v_i
+    SAE:
+        x_hat = b + sum_i f_i(x) v_i
 
-    Manifold-refined SAE:
-        x_hat = b + sum_{i active} f_i(x) (v_i + U_i z_i(x))
+    Refined top-k model:
+        x_hat = b + sum_{i in top-k} f_i(x) [v_i + U_i z_i(x)]
     """
 
-    def __init__(self, sae: nn.Module, cfg: ManifoldSAEConfig):
+    def __init__(self, sae: FrozenSAEWrapper, cfg: ManifoldSAEConfig):
         super().__init__()
-
         self.sae = sae
         self.cfg = cfg
 
@@ -369,22 +385,10 @@ class ManifoldRefinedSAE(nn.Module):
             hidden_dim=cfg.hidden_dim,
         )
 
-        self.U = nn.Parameter(
-            0.01 * torch.randn(cfg.n_features, cfg.d_model, cfg.rank)
-        )
+        self.U = nn.Parameter(0.01 * torch.randn(cfg.d_sae, cfg.d_model, cfg.rank))
 
     def get_decoder_params(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Modify this if your SAE names are different.
-        Expected:
-            W_dec: [n_features, d_model]
-            b_dec: [d_model]
-        """
-
-        W_dec = self.sae.W_dec
-        b_dec = self.sae.b_dec
-
-        return W_dec, b_dec
+        return self.sae.W_dec, self.sae.b_dec
 
     @torch.no_grad()
     def encode_frozen(self, x: torch.Tensor) -> torch.Tensor:
@@ -392,45 +396,27 @@ class ManifoldRefinedSAE(nn.Module):
 
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         cfg = self.cfg
-
         W_dec, b_dec = self.get_decoder_params()
-
-        if cfg.normalize_decoder:
-            W_use = F.normalize(W_dec, dim=-1)
-        else:
-            W_use = W_dec
+        W_use = F.normalize(W_dec, dim=-1) if cfg.normalize_decoder else W_dec
 
         with torch.no_grad():
             f = self.encode_frozen(x)
-
             x_hat_sae_full = b_dec + f @ W_use
-
             f_active, active_idx = torch.topk(
                 f,
-                k=cfg.top_k,
+                k=min(cfg.top_k, f.shape[-1]),
                 dim=-1,
                 largest=True,
                 sorted=False,
             )
 
         v_active = W_use[active_idx]
-
-        z = self.offset_mlp(
-            f_active=f_active,
-            v_active=v_active,
-            x_hat_sae=x_hat_sae_full,
-        )
-
+        z = self.offset_mlp(f_active=f_active, v_active=v_active, x_hat_sae=x_hat_sae_full)
         U_active = self.U[active_idx]
-
         delta = torch.einsum("bkdr,bkr->bkd", U_active, z)
 
         refined_atoms = v_active + delta
-        contrib = f_active[..., None] * refined_atoms
-
-        x_hat_refined = b_dec + contrib.sum(dim=1)
-
-        # For fair comparison, also compute top-k-only SAE reconstruction.
+        x_hat_refined = b_dec + (f_active[..., None] * refined_atoms).sum(dim=1)
         x_hat_sae_topk = b_dec + (f_active[..., None] * v_active).sum(dim=1)
 
         return {
@@ -447,20 +433,17 @@ class ManifoldRefinedSAE(nn.Module):
 
     def compute_loss(self, x: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         out = self.forward(x)
+        cfg = self.cfg
 
         x_hat_refined = out["x_hat_refined"]
         x_hat_sae_full = out["x_hat_sae_full"]
         x_hat_sae_topk = out["x_hat_sae_topk"]
-
         f_active = out["f_active"]
         v_active = out["v_active"]
         delta = out["delta"]
         z = out["z"]
 
-        cfg = self.cfg
-
         loss_rec = F.mse_loss(x_hat_refined, x)
-
         loss_delta = (f_active[..., None].pow(2) * delta.pow(2)).mean()
         loss_z = z.pow(2).mean()
 
@@ -478,22 +461,12 @@ class ManifoldRefinedSAE(nn.Module):
         with torch.no_grad():
             loss_sae_full = F.mse_loss(x_hat_sae_full, x)
             loss_sae_topk = F.mse_loss(x_hat_sae_topk, x)
-
-            r_sae = x - x_hat_sae_topk
-            r_offset = x_hat_refined - x_hat_sae_topk
-
-            residual_mse_after = (r_sae - r_offset).pow(2).mean()
-            residual_mse_before = r_sae.pow(2).mean().clamp_min(1e-8)
-
-            residual_r2 = 1.0 - residual_mse_after / residual_mse_before
-
-            relative_improvement_vs_topk = (
-                loss_sae_topk - loss_rec
-            ) / loss_sae_topk.clamp_min(1e-8)
-
-            relative_improvement_vs_full = (
-                loss_sae_full - loss_rec
-            ) / loss_sae_full.clamp_min(1e-8)
+            residual_before = (x - x_hat_sae_topk).pow(2).mean().clamp_min(1e-8)
+            residual_after = (x - x_hat_refined).pow(2).mean()
+            residual_r2 = 1.0 - residual_after / residual_before
+            relative_improvement_vs_topk = (loss_sae_topk - loss_rec) / loss_sae_topk.clamp_min(1e-8)
+            relative_improvement_vs_full = (loss_sae_full - loss_rec) / loss_sae_full.clamp_min(1e-8)
+            mean_l0 = (out["f"] > 0).float().sum(dim=-1).mean()
 
         logs = {
             "loss": loss.detach(),
@@ -503,46 +476,43 @@ class ManifoldRefinedSAE(nn.Module):
             "loss_delta": loss_delta.detach(),
             "loss_z": loss_z.detach(),
             "loss_parallel": loss_parallel.detach(),
-            "residual_r2": residual_r2.detach(),
-            "relative_improvement_vs_topk": relative_improvement_vs_topk.detach(),
-            "relative_improvement_vs_full": relative_improvement_vs_full.detach(),
+            "residual_r2_vs_topk": residual_r2.detach(),
+            "rel_improve_vs_topk": relative_improvement_vs_topk.detach(),
+            "rel_improve_vs_full": relative_improvement_vs_full.detach(),
+            "mean_l0": mean_l0.detach(),
         }
-
         return loss, logs
 
 
 # ============================================================
-# 4. Scalar-rescaling baseline
+# 5. Scalar-rescaling baseline
 # ============================================================
+
 
 class ScalarRescaleSAE(nn.Module):
     """
     Baseline:
         x_hat = b + sum_i alpha_i(x) f_i(x) v_i
 
-    This tests whether the manifold offset is doing more than changing feature amplitude.
+    This checks whether your offset model is only changing amplitudes.
     """
 
     def __init__(
         self,
-        sae: nn.Module,
+        sae: FrozenSAEWrapper,
         d_model: int,
-        n_features: int,
         top_k: int = 32,
         hidden_dim: int = 128,
     ):
         super().__init__()
-
         self.sae = sae
         self.d_model = d_model
-        self.n_features = n_features
         self.top_k = top_k
 
         for p in self.sae.parameters():
             p.requires_grad = False
 
         in_dim = 1 + d_model + d_model
-
         self.alpha_mlp = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
             nn.GELU(),
@@ -550,49 +520,35 @@ class ScalarRescaleSAE(nn.Module):
             nn.GELU(),
             nn.Linear(hidden_dim, 1),
         )
-
         nn.init.zeros_(self.alpha_mlp[-1].weight)
         nn.init.zeros_(self.alpha_mlp[-1].bias)
 
-    def get_decoder_params(self):
-        W_dec = self.sae.W_dec
-        b_dec = self.sae.b_dec
-        return W_dec, b_dec
-
     @torch.no_grad()
-    def encode_frozen(self, x):
+    def encode_frozen(self, x: torch.Tensor) -> torch.Tensor:
         return self.sae.encode(x)
 
-    def forward(self, x):
-        W_dec, b_dec = self.get_decoder_params()
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        W_dec, b_dec = self.sae.W_dec, self.sae.b_dec
 
         with torch.no_grad():
             f = self.encode_frozen(x)
             x_hat_sae_full = b_dec + f @ W_dec
-
             f_active, active_idx = torch.topk(
                 f,
-                k=self.top_k,
+                k=min(self.top_k, f.shape[-1]),
                 dim=-1,
                 largest=True,
                 sorted=False,
             )
 
         v_active = W_dec[active_idx]
-
         batch, k, d_model = v_active.shape
-
         x_context = x_hat_sae_full[:, None, :].expand(batch, k, d_model)
-        f_context = f_active[..., None]
+        inp = torch.cat([f_active[..., None], v_active, x_context], dim=-1)
 
-        inp = torch.cat([f_context, v_active, x_context], dim=-1)
-
+        # Near-identity initialization.
         alpha = 1.0 + 0.1 * self.alpha_mlp(inp).squeeze(-1)
-
-        x_hat_rescaled = b_dec + (
-            alpha[..., None] * f_active[..., None] * v_active
-        ).sum(dim=1)
-
+        x_hat_rescaled = b_dec + (alpha[..., None] * f_active[..., None] * v_active).sum(dim=1)
         x_hat_sae_topk = b_dec + (f_active[..., None] * v_active).sum(dim=1)
 
         return {
@@ -602,11 +558,11 @@ class ScalarRescaleSAE(nn.Module):
             "alpha": alpha,
             "active_idx": active_idx,
             "f_active": f_active,
+            "f": f,
         }
 
-    def compute_loss(self, x):
+    def compute_loss(self, x: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         out = self.forward(x)
-
         x_hat_rescaled = out["x_hat_rescaled"]
         x_hat_sae_full = out["x_hat_sae_full"]
         x_hat_sae_topk = out["x_hat_sae_topk"]
@@ -616,58 +572,72 @@ class ScalarRescaleSAE(nn.Module):
         with torch.no_grad():
             loss_sae_full = F.mse_loss(x_hat_sae_full, x)
             loss_sae_topk = F.mse_loss(x_hat_sae_topk, x)
-
-            relative_improvement_vs_topk = (
-                loss_sae_topk - loss
-            ) / loss_sae_topk.clamp_min(1e-8)
-
-            relative_improvement_vs_full = (
-                loss_sae_full - loss
-            ) / loss_sae_full.clamp_min(1e-8)
+            relative_improvement_vs_topk = (loss_sae_topk - loss) / loss_sae_topk.clamp_min(1e-8)
+            relative_improvement_vs_full = (loss_sae_full - loss) / loss_sae_full.clamp_min(1e-8)
+            mean_l0 = (out["f"] > 0).float().sum(dim=-1).mean()
 
         logs = {
             "loss": loss.detach(),
             "loss_sae_full": loss_sae_full.detach(),
             "loss_sae_topk": loss_sae_topk.detach(),
-            "relative_improvement_vs_topk": relative_improvement_vs_topk.detach(),
-            "relative_improvement_vs_full": relative_improvement_vs_full.detach(),
+            "rel_improve_vs_topk": relative_improvement_vs_topk.detach(),
+            "rel_improve_vs_full": relative_improvement_vs_full.detach(),
+            "mean_l0": mean_l0.detach(),
         }
-
         return loss, logs
 
 
 # ============================================================
-# 5. Training / evaluation loops
+# 6. Train/eval loops
 # ============================================================
 
-def move_batch_to_device(batch, device):
+
+def move_batch_to_device(batch, device: str) -> torch.Tensor:
     if isinstance(batch, torch.Tensor):
         return batch.to(device)
-
     if isinstance(batch, (tuple, list)):
         return batch[0].to(device)
-
     if isinstance(batch, dict):
         if "x" in batch:
             return batch["x"].to(device)
         if "activation" in batch:
             return batch["activation"].to(device)
+    raise ValueError("Unknown batch format")
 
-    raise ValueError("Unknown batch format.")
+
+@torch.no_grad()
+def evaluate_model(model: nn.Module, loader: DataLoader, device: str) -> Dict[str, float]:
+    model.eval()
+    totals: Dict[str, float] = {}
+    n = 0
+
+    for batch in loader:
+        x = move_batch_to_device(batch, device).float()
+        _, logs = model.compute_loss(x)
+        for k, v in logs.items():
+            val = v.item() if torch.is_tensor(v) else float(v)
+            totals[k] = totals.get(k, 0.0) + val
+        n += 1
+
+    return {k: v / max(n, 1) for k, v in totals.items()}
+
+
+def format_metrics(metrics: Dict[str, float]) -> str:
+    return " ".join(f"{k}={v:.6g}" for k, v in metrics.items())
 
 
 def train_model(
     model: nn.Module,
     train_loader: DataLoader,
-    val_loaders: Optional[Dict[str, DataLoader]] = None,
-    lr: float = 1e-3,
-    weight_decay: float = 1e-4,
-    num_epochs: int = 5,
-    device: str = "cuda",
-    log_every: int = 100,
-):
+    val_loader: Optional[DataLoader],
+    lr: float,
+    weight_decay: float,
+    num_epochs: int,
+    device: str,
+    log_every: int,
+    save_path: Optional[str] = None,
+) -> nn.Module:
     model.to(device)
-
     optimizer = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
         lr=lr,
@@ -675,13 +645,12 @@ def train_model(
     )
 
     step = 0
+    best_val = math.inf
 
     for epoch in range(num_epochs):
         model.train()
-
         for batch in train_loader:
-            x = move_batch_to_device(batch, device)
-
+            x = move_batch_to_device(batch, device).float()
             loss, logs = model.compute_loss(x)
 
             optimizer.zero_grad(set_to_none=True)
@@ -690,249 +659,202 @@ def train_model(
             optimizer.step()
 
             if step % log_every == 0:
-                log_str = " ".join(
-                    f"{k}={v.item():.6f}"
-                    for k, v in logs.items()
-                    if torch.is_tensor(v) and v.ndim == 0
-                )
-                print(f"epoch={epoch} step={step} {log_str}")
-
+                print(f"epoch={epoch} step={step} {format_metrics({k: v.item() for k, v in logs.items()})}")
             step += 1
 
-        if val_loaders is not None:
-            for name, loader in val_loaders.items():
-                metrics = evaluate_model(model, loader, device=device)
-                metric_str = " ".join(f"{k}={v:.6f}" for k, v in metrics.items())
-                print(f"[val:{name}] {metric_str}")
+        if val_loader is not None:
+            metrics = evaluate_model(model, val_loader, device=device)
+            print(f"[val epoch={epoch}] {format_metrics(metrics)}")
 
+            val_loss = metrics.get("loss", math.inf)
+            if save_path is not None and val_loss < best_val:
+                best_val = val_loss
+                os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+                torch.save(model.state_dict(), save_path)
+                print(f"Saved best model to {save_path}")
 
-@torch.no_grad()
-def evaluate_model(
-    model: nn.Module,
-    loader: DataLoader,
-    device: str = "cuda",
-):
-    model.eval()
-
-    totals = {}
-    n = 0
-
-    for batch in loader:
-        x = move_batch_to_device(batch, device)
-
-        _, logs = model.compute_loss(x)
-
-        for k, v in logs.items():
-            if torch.is_tensor(v):
-                totals[k] = totals.get(k, 0.0) + v.item()
-            else:
-                totals[k] = totals.get(k, 0.0) + float(v)
-
-        n += 1
-
-    return {k: v / max(n, 1) for k, v in totals.items()}
+    return model
 
 
 # ============================================================
-# 6. Cross-dataset experiment runner
+# 7. Loading SAE Lens SAE + running experiment
 # ============================================================
 
-def build_activation_loaders_for_dataset(
-    dataset_name: str,
-    lm_model,
-    tokenizer,
-    layer_idx: int,
-    seq_len: int,
-    token_batch_size: int,
-    activation_batch_size: int,
-    max_examples: Optional[int],
-    max_tokens: Optional[int],
-    max_activation_batches: Optional[int],
+
+def load_model_and_sae(
+    model_name: str,
+    release: str,
+    sae_id: str,
     device: str,
-):
-    token_train_loader = make_text_dataloader(
-        dataset_name=dataset_name,
-        tokenizer=tokenizer,
-        split="train",
-        seq_len=seq_len,
-        batch_size=token_batch_size,
-        max_examples=max_examples,
-        max_tokens=max_tokens,
-        shuffle=True,
-    )
+) -> Tuple[HookedTransformer, FrozenSAEWrapper, Dict]:
+    print(f"Loading TransformerLens model: {model_name}")
+    tl_model = HookedTransformer.from_pretrained(model_name, device=device)
+    tl_model.eval()
 
-    act_train_loader = make_activation_loader(
-        model=lm_model,
-        token_loader=token_train_loader,
-        layer_idx=layer_idx,
-        activation_batch_size=activation_batch_size,
+    print(f"Loading SAE Lens SAE: release={release}, sae_id={sae_id}")
+    sae, cfg_dict, sparsity = SAE.from_pretrained(
+        release=release,
+        sae_id=sae_id,
         device=device,
-        token_position="all",
-        max_activation_batches=max_activation_batches,
-        shuffle=True,
     )
+    sae.eval()
 
-    return act_train_loader
+    # Some old/example code calls fold_W_dec_norm(). It is useful for dashboards,
+    # but for reconstruction experiments it can change feature scales. Leave off
+    # unless you know you want the folded representation.
+
+    wrapped = FrozenSAEWrapper(sae)
+    return tl_model, wrapped, cfg_dict
 
 
-def run_cross_dataset_experiment(
-    sae,
-    lm_model_name: str = "gpt2",
-    layer_idx: int = 6,
-    d_model: int = 768,
-    n_features: int = 16384,
-    seq_len: int = 128,
-    token_batch_size: int = 8,
-    activation_batch_size: int = 1024,
-    max_examples_tinystories: int = 5000,
-    max_tokens_shakespeare: int = 2_000_000,
-    max_activation_batches: int = 100,
-    top_k: int = 32,
-    rank: int = 4,
-    device: str = "cuda",
-):
-    tokenizer = AutoTokenizer.from_pretrained(lm_model_name)
-    lm_model = AutoModelForCausalLM.from_pretrained(lm_model_name)
+def infer_dims(sae: FrozenSAEWrapper) -> Tuple[int, int]:
+    W_dec = sae.W_dec
+    if W_dec.ndim != 2:
+        raise ValueError(f"Expected W_dec to be 2D, got shape {tuple(W_dec.shape)}")
+    d_sae, d_model = W_dec.shape
+    return d_sae, d_model
 
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
 
-    lm_model.to(device)
-    lm_model.eval()
+def run(args: argparse.Namespace) -> None:
+    set_seed(args.seed)
+    device = args.device or get_device()
+    print(f"Using device: {device}")
 
-    print("Building TinyShakespeare activations...")
-    shakespeare_loader = build_activation_loaders_for_dataset(
-        dataset_name="tinyshakespeare",
-        lm_model=lm_model,
-        tokenizer=tokenizer,
-        layer_idx=layer_idx,
-        seq_len=seq_len,
-        token_batch_size=token_batch_size,
-        activation_batch_size=activation_batch_size,
-        max_examples=None,
-        max_tokens=max_tokens_shakespeare,
-        max_activation_batches=max_activation_batches,
+    tl_model, sae, cfg_dict = load_model_and_sae(
+        model_name=args.model_name,
+        release=args.release,
+        sae_id=args.sae_id,
         device=device,
     )
 
-    print("Building TinyStories activations...")
-    stories_loader = build_activation_loaders_for_dataset(
-        dataset_name="tinystories",
-        lm_model=lm_model,
-        tokenizer=tokenizer,
-        layer_idx=layer_idx,
-        seq_len=seq_len,
-        token_batch_size=token_batch_size,
-        activation_batch_size=activation_batch_size,
-        max_examples=max_examples_tinystories,
-        max_tokens=None,
-        max_activation_batches=max_activation_batches,
+    hook_name = getattr(sae.sae.cfg, "hook_name", None)
+    if hook_name is None:
+        hook_name = args.sae_id
+    print(f"Using hook_name: {hook_name}")
+
+    d_sae, d_model = infer_dims(sae)
+    print(f"SAE dimensions: d_sae={d_sae}, d_model={d_model}")
+
+    train_loader, val_loader = make_activation_loaders(
+        tl_model=tl_model,
+        dataset=args.dataset,
+        hook_name=hook_name,
+        seq_len=args.seq_len,
+        token_batch_size=args.token_batch_size,
+        activation_batch_size=args.activation_batch_size,
         device=device,
+        max_examples=args.max_examples,
+        max_tokens=args.max_tokens,
+        max_token_blocks=args.max_token_blocks,
+        val_fraction=args.val_fraction,
+        seed=args.seed,
     )
 
-    # ------------------------------------------------------------
-    # Train on TinyShakespeare, evaluate on both
-    # ------------------------------------------------------------
-
-    cfg = ManifoldSAEConfig(
+    print("\nTraining scalar-rescaling baseline...")
+    scalar_model = ScalarRescaleSAE(
+        sae=sae,
         d_model=d_model,
-        n_features=n_features,
-        top_k=top_k,
-        rank=rank,
-        hidden_dim=256,
-        lambda_delta=1e-3,
-        lambda_z=1e-4,
-        lambda_parallel=1e-3,
-        normalize_decoder=False,
+        top_k=args.top_k,
+        hidden_dim=args.scalar_hidden_dim,
     )
-
-    print("\nTraining manifold model on TinyShakespeare...")
-    manifold_shakespeare = ManifoldRefinedSAE(sae=sae, cfg=cfg)
-
     train_model(
-        model=manifold_shakespeare,
-        train_loader=shakespeare_loader,
-        val_loaders={
-            "tinyshakespeare": shakespeare_loader,
-            "tinystories": stories_loader,
-        },
-        lr=1e-3,
-        weight_decay=1e-4,
-        num_epochs=5,
+        model=scalar_model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        num_epochs=args.num_epochs,
         device=device,
-        log_every=100,
+        log_every=args.log_every,
+        save_path=args.scalar_save_path,
     )
+    scalar_metrics = evaluate_model(scalar_model, val_loader, device=device)
+    print(f"[final scalar] {format_metrics(scalar_metrics)}")
 
-    # ------------------------------------------------------------
-    # Train on TinyStories, evaluate on both
-    # ------------------------------------------------------------
-
-    print("\nTraining manifold model on TinyStories...")
-    manifold_stories = ManifoldRefinedSAE(sae=sae, cfg=cfg)
-
+    print("\nTraining manifold-refined SAE...")
+    manifold_cfg = ManifoldSAEConfig(
+        d_model=d_model,
+        d_sae=d_sae,
+        top_k=args.top_k,
+        rank=args.rank,
+        hidden_dim=args.manifold_hidden_dim,
+        lambda_delta=args.lambda_delta,
+        lambda_z=args.lambda_z,
+        lambda_parallel=args.lambda_parallel,
+        normalize_decoder=args.normalize_decoder,
+    )
+    manifold_model = ManifoldRefinedSAE(sae=sae, cfg=manifold_cfg)
     train_model(
-        model=manifold_stories,
-        train_loader=stories_loader,
-        val_loaders={
-            "tinyshakespeare": shakespeare_loader,
-            "tinystories": stories_loader,
-        },
-        lr=1e-3,
-        weight_decay=1e-4,
-        num_epochs=5,
+        model=manifold_model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        num_epochs=args.num_epochs,
         device=device,
-        log_every=100,
+        log_every=args.log_every,
+        save_path=args.manifold_save_path,
     )
+    manifold_metrics = evaluate_model(manifold_model, val_loader, device=device)
+    print(f"[final manifold] {format_metrics(manifold_metrics)}")
 
-    return {
-        "manifold_shakespeare": manifold_shakespeare,
-        "manifold_stories": manifold_stories,
-        "shakespeare_loader": shakespeare_loader,
-        "stories_loader": stories_loader,
-    }
+    print("\nSummary:")
+    print(f"scalar.rel_improve_vs_full   = {scalar_metrics.get('rel_improve_vs_full', float('nan')):.6g}")
+    print(f"manifold.rel_improve_vs_full = {manifold_metrics.get('rel_improve_vs_full', float('nan')):.6g}")
+    print(f"scalar.rel_improve_vs_topk   = {scalar_metrics.get('rel_improve_vs_topk', float('nan')):.6g}")
+    print(f"manifold.rel_improve_vs_topk = {manifold_metrics.get('rel_improve_vs_topk', float('nan')):.6g}")
 
 
 # ============================================================
-# 7. Example usage
+# 8. CLI
 # ============================================================
+
+
+def build_argparser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser()
+
+    # SAE / model
+    p.add_argument("--model-name", type=str, default="gpt2-small")
+    p.add_argument("--release", type=str, default="gpt2-small-res-jb")
+    p.add_argument("--sae-id", type=str, default="blocks.6.hook_resid_pre")
+
+    # Data
+    p.add_argument("--dataset", type=str, default="tinyshakespeare", choices=["tinyshakespeare", "tinystories"])
+    p.add_argument("--seq-len", type=int, default=128)
+    p.add_argument("--max-examples", type=int, default=None)
+    p.add_argument("--max-tokens", type=int, default=2_000_000)
+    p.add_argument("--max-token-blocks", type=int, default=256)
+    p.add_argument("--val-fraction", type=float, default=0.05)
+
+    # Batches
+    p.add_argument("--token-batch-size", type=int, default=8)
+    p.add_argument("--activation-batch-size", type=int, default=1024)
+
+    # Model hyperparams
+    p.add_argument("--top-k", type=int, default=32)
+    p.add_argument("--rank", type=int, default=4)
+    p.add_argument("--manifold-hidden-dim", type=int, default=256)
+    p.add_argument("--scalar-hidden-dim", type=int, default=128)
+    p.add_argument("--lambda-delta", type=float, default=1e-3)
+    p.add_argument("--lambda-z", type=float, default=1e-4)
+    p.add_argument("--lambda-parallel", type=float, default=1e-3)
+    p.add_argument("--normalize-decoder", action="store_true")
+
+    # Optim
+    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--weight-decay", type=float, default=1e-4)
+    p.add_argument("--num-epochs", type=int, default=3)
+    p.add_argument("--log-every", type=int, default=50)
+
+    # Misc
+    p.add_argument("--device", type=str, default=None)
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--scalar-save-path", type=str, default="checkpoints/scalar_rescale.pt")
+    p.add_argument("--manifold-save-path", type=str, default="checkpoints/manifold_refined.pt")
+
+    return p
+
 
 if __name__ == "__main__":
-    """
-    You need to load your trained SAE here.
-
-    Example placeholder:
-
-        sae = torch.load("my_sae.pt")
-
-    Your SAE must expose:
-        sae.encode(x)
-        sae.W_dec
-        sae.b_dec
-    """
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    raise NotImplementedError(
-        "Load your trained SAE here, then call run_cross_dataset_experiment(sae=sae, ...)."
-    )
-
-    # Example:
-    #
-    # sae = torch.load("my_sae.pt", map_location=device)
-    #
-    # results = run_cross_dataset_experiment(
-    #     sae=sae,
-    #     lm_model_name="gpt2",
-    #     layer_idx=6,
-    #     d_model=768,
-    #     n_features=16384,
-    #     seq_len=128,
-    #     token_batch_size=8,
-    #     activation_batch_size=1024,
-    #     max_examples_tinystories=5000,
-    #     max_tokens_shakespeare=2_000_000,
-    #     max_activation_batches=100,
-    #     top_k=32,
-    #     rank=4,
-    #     device=device,
-    # )
+    args = build_argparser().parse_args()
+    run(args)
