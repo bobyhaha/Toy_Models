@@ -37,6 +37,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset, random_split
 from tqdm import tqdm
+import gc
 
 from datasets import load_dataset
 from sae_lens import SAE
@@ -904,132 +905,191 @@ def run(args: argparse.Namespace) -> None:
     device = args.device or get_device()
     print(f"Using device: {device}")
 
-    tl_model, sae, cfg_dict = load_model_and_sae(
-        model_name=args.model_name,
-        release=args.release,
-        sae_id=args.sae_id,
-        device=device,
-    )
+    # Load GPT-2 / TransformerLens model only once.
+    print(f"Loading TransformerLens model: {args.model_name}")
+    tl_model = HookedTransformer.from_pretrained(args.model_name, device=device)
+    tl_model.eval()
 
-    hook_name = infer_hook_name(sae, args.sae_id)
-    print(f"Using hook_name: {hook_name}")
+    all_results = []
 
-    d_sae, d_model = infer_dims(sae)
-    print(f"SAE dimensions: d_sae={d_sae}, d_model={d_model}")
+    for layer_idx in range(args.layer_start, args.layer_end + 1):
+        sae_id = args.sae_id_template.format(layer=layer_idx)
 
-    train_loader, val_loader = make_activation_loaders(
-        tl_model=tl_model,
-        dataset=args.dataset,
-        hook_name=hook_name,
-        seq_len=args.seq_len,
-        token_batch_size=args.token_batch_size,
-        activation_batch_size=args.activation_batch_size,
-        device=device,
-        max_examples=args.max_examples,
-        max_tokens=args.max_tokens,
-        max_token_blocks=args.max_token_blocks,
-        val_fraction=args.val_fraction,
-        seed=args.seed,
-    )
+        print("\n" + "=" * 80)
+        print(f"Layer {layer_idx}: loading SAE {sae_id}")
+        print("=" * 80)
+
+        sae_raw, cfg_dict, sparsity = SAE.from_pretrained(
+            release=args.release,
+            sae_id=sae_id,
+            device=device,
+        )
+        sae_raw.eval()
+
+        sae = FrozenSAEWrapper(sae_raw)
+
+        hook_name = infer_hook_name(sae, sae_id)
+        d_sae, d_model = infer_dims(sae)
+
+        print(f"Layer {layer_idx}: hook_name={hook_name}")
+        print(f"Layer {layer_idx}: d_sae={d_sae}, d_model={d_model}")
+
+        train_loader, val_loader = make_activation_loaders(
+            tl_model=tl_model,
+            dataset=args.dataset,
+            hook_name=hook_name,
+            seq_len=args.seq_len,
+            token_batch_size=args.token_batch_size,
+            activation_batch_size=args.activation_batch_size,
+            device=device,
+            max_examples=args.max_examples,
+            max_tokens=args.max_tokens,
+            max_token_blocks=args.max_token_blocks,
+            val_fraction=args.val_fraction,
+            seed=args.seed,
+        )
+
+        # ------------------------------------------------------------
+        # Scalar baseline for this layer
+        # ------------------------------------------------------------
+
+        print(f"\nTraining scalar-rescaling baseline for layer {layer_idx}...")
+
+        scalar_model = ScalarRescaleSAE(
+            sae=sae,
+            d_model=d_model,
+            top_k=args.top_k,
+            hidden_dim=args.scalar_hidden_dim,
+        )
+
+        scalar_save_path = args.scalar_save_path_template.format(layer=layer_idx)
+
+        train_model(
+            model=scalar_model,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+            num_epochs=args.num_epochs,
+            device=device,
+            log_every=args.log_every,
+            save_path=scalar_save_path,
+        )
+
+        scalar_metrics = evaluate_model(
+            scalar_model,
+            val_loader,
+            device=device,
+        )
+
+        print(f"[layer {layer_idx} final scalar] {format_metrics(scalar_metrics)}")
+
+        # ------------------------------------------------------------
+        # Manifold model for this layer
+        # ------------------------------------------------------------
+
+        print(f"\nTraining manifold-refined SAE for layer {layer_idx}...")
+
+        manifold_cfg = ManifoldSAEConfig(
+            d_model=d_model,
+            d_sae=d_sae,
+            top_k=args.top_k,
+            rank=args.rank,
+            hidden_dim=args.manifold_hidden_dim,
+            lambda_delta=args.lambda_delta,
+            lambda_z=args.lambda_z,
+            lambda_parallel=args.lambda_parallel,
+            normalize_decoder=args.normalize_decoder,
+        )
+
+        manifold_model = ManifoldRefinedSAE(
+            sae=sae,
+            cfg=manifold_cfg,
+        )
+
+        manifold_save_path = args.manifold_save_path_template.format(layer=layer_idx)
+
+        train_model(
+            model=manifold_model,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+            num_epochs=args.num_epochs,
+            device=device,
+            log_every=args.log_every,
+            save_path=manifold_save_path,
+        )
+
+        manifold_metrics = evaluate_model(
+            manifold_model,
+            val_loader,
+            device=device,
+        )
+
+        print(f"[layer {layer_idx} final manifold] {format_metrics(manifold_metrics)}")
+
+        result = {
+            "layer": layer_idx,
+            "sae_id": sae_id,
+            "hook_name": hook_name,
+            "scalar_rel_improve_vs_full": scalar_metrics.get("rel_improve_vs_full", float("nan")),
+            "scalar_rel_improve_vs_topk": scalar_metrics.get("rel_improve_vs_topk", float("nan")),
+            "manifold_rel_improve_vs_full": manifold_metrics.get("rel_improve_vs_full", float("nan")),
+            "manifold_rel_improve_vs_topk": manifold_metrics.get("rel_improve_vs_topk", float("nan")),
+            "scalar_loss": scalar_metrics.get("loss", float("nan")),
+            "manifold_loss": manifold_metrics.get("loss", float("nan")),
+            "sae_full_loss": manifold_metrics.get("loss_sae_full", float("nan")),
+            "sae_topk_loss": manifold_metrics.get("loss_sae_topk", float("nan")),
+            "mean_l0": manifold_metrics.get("mean_l0", float("nan")),
+        }
+
+        all_results.append(result)
+
+        print("\nLayer result:")
+        for k, v in result.items():
+            print(f"  {k}: {v}")
+
+        # Clear memory before next layer.
+        del sae_raw
+        del sae
+        del scalar_model
+        del manifold_model
+        del train_loader
+        del val_loader
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     # ------------------------------------------------------------
-    # Scalar baseline
+    # Final summary table
     # ------------------------------------------------------------
 
-    print("\nTraining scalar-rescaling baseline...")
+    print("\n" + "=" * 80)
+    print("All-layer summary")
+    print("=" * 80)
 
-    scalar_model = ScalarRescaleSAE(
-        sae=sae,
-        d_model=d_model,
-        top_k=args.top_k,
-        hidden_dim=args.scalar_hidden_dim,
+    header = (
+        "layer | scalar_vs_full | manifold_vs_full | "
+        "scalar_vs_topk | manifold_vs_topk | sae_full_loss | sae_topk_loss | mean_l0"
     )
+    print(header)
+    print("-" * len(header))
 
-    train_model(
-        model=scalar_model,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-        num_epochs=args.num_epochs,
-        device=device,
-        log_every=args.log_every,
-        save_path=args.scalar_save_path,
-    )
+    for r in all_results:
+        print(
+            f"{r['layer']:>5} | "
+            f"{r['scalar_rel_improve_vs_full']:>14.6g} | "
+            f"{r['manifold_rel_improve_vs_full']:>16.6g} | "
+            f"{r['scalar_rel_improve_vs_topk']:>14.6g} | "
+            f"{r['manifold_rel_improve_vs_topk']:>16.6g} | "
+            f"{r['sae_full_loss']:>13.6g} | "
+            f"{r['sae_topk_loss']:>13.6g} | "
+            f"{r['mean_l0']:>7.4g}"
+        )
 
-    scalar_metrics = evaluate_model(
-        scalar_model,
-        val_loader,
-        device=device,
-    )
-
-    print(f"[final scalar] {format_metrics(scalar_metrics)}")
-
-    # ------------------------------------------------------------
-    # Manifold model
-    # ------------------------------------------------------------
-
-    print("\nTraining manifold-refined SAE...")
-
-    manifold_cfg = ManifoldSAEConfig(
-        d_model=d_model,
-        d_sae=d_sae,
-        top_k=args.top_k,
-        rank=args.rank,
-        hidden_dim=args.manifold_hidden_dim,
-        lambda_delta=args.lambda_delta,
-        lambda_z=args.lambda_z,
-        lambda_parallel=args.lambda_parallel,
-        normalize_decoder=args.normalize_decoder,
-    )
-
-    manifold_model = ManifoldRefinedSAE(
-        sae=sae,
-        cfg=manifold_cfg,
-    )
-
-    train_model(
-        model=manifold_model,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-        num_epochs=args.num_epochs,
-        device=device,
-        log_every=args.log_every,
-        save_path=args.manifold_save_path,
-    )
-
-    manifold_metrics = evaluate_model(
-        manifold_model,
-        val_loader,
-        device=device,
-    )
-
-    print(f"[final manifold] {format_metrics(manifold_metrics)}")
-
-    # ------------------------------------------------------------
-    # Summary
-    # ------------------------------------------------------------
-
-    print("\nSummary:")
-    print(
-        f"scalar.rel_improve_vs_full   = "
-        f"{scalar_metrics.get('rel_improve_vs_full', float('nan')):.6g}"
-    )
-    print(
-        f"manifold.rel_improve_vs_full = "
-        f"{manifold_metrics.get('rel_improve_vs_full', float('nan')):.6g}"
-    )
-    print(
-        f"scalar.rel_improve_vs_topk   = "
-        f"{scalar_metrics.get('rel_improve_vs_topk', float('nan')):.6g}"
-    )
-    print(
-        f"manifold.rel_improve_vs_topk = "
-        f"{manifold_metrics.get('rel_improve_vs_topk', float('nan')):.6g}"
-    )
-
+    print("\nDone.")
 
 # ============================================================
 # 9. CLI
