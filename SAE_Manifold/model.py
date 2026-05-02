@@ -1,31 +1,71 @@
 """
-SAE Lens Manifold-Refined SAE Experiment
-=======================================
+SAE Lens Manifold-Refined SAE Experiment with Controls
+======================================================
 
-This script:
-1. Loads GPT-2 small with TransformerLens.
-2. Loads a pretrained SAE from SAE Lens.
-3. Caches activations from the SAE's hook point.
-4. Freezes the SAE.
-5. Trains:
-   - ScalarRescaleSAE baseline
-   - ManifoldRefinedSAE model
+This script tests whether SAE decoder vectors behave like means of local
+feature manifolds.
+
+Main reconstruction:
+
+    SAE:
+        x_hat = b + sum_i f_i(x) v_i
+
+    Manifold model:
+        x_hat = b + sum_{i in topk(f)} f_i(x) [v_i + delta_i(x)]
+        delta_i(x) = U_i z_i(x)
+
+where:
+    v_i is interpreted as the feature mean direction mu_i
+    delta_i(x) is the context-dependent deviation from that mean.
+
+Controls included:
+    1. Scalar-rescaling baseline:
+        x_hat = b + sum_i alpha_i(x) f_i(x) v_i
+
+    2. Same-size generic residual MLP adversary:
+        x_hat = x_hat_topk + g(x_hat_full, x_hat_topk)
+
+    3. Random activation controls:
+        --random-control gaussian
+        --random-control shuffle_dims
 
 Install:
     pip install torch transformer-lens sae-lens datasets tqdm
 
-Run:
+Example run:
     python model.py \
-        --dataset tinyshakespeare \
-        --release gpt2-small-res-jb \
-        --sae-id blocks.6.hook_resid_pre \
-        --num-epochs 3 \
-        --max-token-blocks 1024 \
-        --activation-batch-size 256 \
-        --log-every 10
+        --dataset tinystories \
+        --max-examples 20000 \
+        --num-epochs 5 \
+        --max-token-blocks 8192 \
+        --activation-batch-size 512 \
+        --top-k 64 \
+        --rank 4 \
+        --lr 1e-4 \
+        --lambda-delta 1e-2 \
+        --lambda-z 1e-3 \
+        --lambda-parallel 1e-2 \
+        --log-every 100
+
+Random control:
+    python model.py \
+        --dataset tinystories \
+        --random-control shuffle_dims \
+        --max-examples 20000 \
+        --num-epochs 5 \
+        --max-token-blocks 8192 \
+        --activation-batch-size 512 \
+        --top-k 64 \
+        --rank 4 \
+        --lr 1e-4 \
+        --lambda-delta 1e-2 \
+        --lambda-z 1e-3 \
+        --lambda-parallel 1e-2 \
+        --log-every 100
 """
 
 import argparse
+import gc
 import math
 import os
 import urllib.request
@@ -37,7 +77,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset, random_split
 from tqdm import tqdm
-import gc
 
 from datasets import load_dataset
 from sae_lens import SAE
@@ -67,8 +106,28 @@ def to_float32(x: torch.Tensor) -> torch.Tensor:
     return x.detach().to(torch.float32)
 
 
+def scalar(x) -> float:
+    if torch.is_tensor(x):
+        return x.detach().float().item()
+    return float(x)
+
+
 def format_metrics(metrics: Dict[str, float]) -> str:
     return " ".join(f"{k}={v:.6g}" for k, v in metrics.items())
+
+
+def count_trainable_params(model: nn.Module) -> int:
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+def count_all_params(model: nn.Module) -> int:
+    return sum(p.numel() for p in model.parameters())
+
+
+def print_param_count(name: str, model: nn.Module) -> None:
+    trainable = count_trainable_params(model)
+    total = count_all_params(model)
+    print(f"{name} params: trainable={trainable:,}, total={total:,}")
 
 
 # ============================================================
@@ -108,7 +167,7 @@ def get_texts(dataset: str, max_examples: Optional[int]) -> List[str]:
 
 class TokenBlockDataset(Dataset):
     """
-    Converts raw text into fixed-length token blocks using TransformerLens's tokenizer.
+    Converts raw text into fixed-length token blocks using TransformerLens tokenizer.
     """
 
     def __init__(
@@ -162,16 +221,13 @@ class TokenBlockDataset(Dataset):
 
 
 # ============================================================
-# 2. Activation caching
+# 2. Activation datasets and random controls
 # ============================================================
 
 
 class ActivationDataset(Dataset):
     """
     Materializes activations from a TransformerLens hook point into memory.
-
-    For a real large experiment, replace this with a streaming buffer.
-    For your current toy experiment, materializing is simpler.
     """
 
     def __init__(
@@ -247,6 +303,77 @@ class ActivationDataset(Dataset):
         return self.activations[idx]
 
 
+class RandomActivationDataset(Dataset):
+    """
+    Random controls for overfitting/capacity testing.
+
+    Modes:
+        gaussian:
+            random Gaussian vectors with the same per-dimension mean/std
+            as real activations.
+
+        shuffle_dims:
+            independently shuffle each dimension across examples.
+            This preserves per-coordinate marginals but destroys vector geometry.
+
+        permute_examples:
+            only permutes examples. This should behave like real data and is a sanity check.
+    """
+
+    def __init__(
+        self,
+        reference_dataset: Dataset,
+        seed: int = 0,
+        mode: str = "gaussian",
+    ):
+        xs = []
+
+        for i in range(len(reference_dataset)):
+            x = reference_dataset[i]
+            if isinstance(x, (tuple, list)):
+                x = x[0]
+            xs.append(x.float().cpu())
+
+        X = torch.stack(xs, dim=0)
+
+        self.mode = mode
+        self.mean = X.mean(dim=0, keepdim=True)
+        self.std = X.std(dim=0, keepdim=True).clamp_min(1e-6)
+
+        g = torch.Generator().manual_seed(seed)
+
+        if mode == "gaussian":
+            self.activations = self.mean + self.std * torch.randn(
+                X.shape,
+                generator=g,
+            )
+
+        elif mode == "shuffle_dims":
+            X_rand = X.clone()
+            for d in tqdm(range(X.shape[1]), desc="Shuffling activation dimensions"):
+                perm = torch.randperm(X.shape[0], generator=g)
+                X_rand[:, d] = X_rand[perm, d]
+            self.activations = X_rand
+
+        elif mode == "permute_examples":
+            perm = torch.randperm(X.shape[0], generator=g)
+            self.activations = X[perm]
+
+        else:
+            raise ValueError(f"Unknown random mode: {mode}")
+
+        print(
+            f"RandomActivationDataset: mode={mode}, "
+            f"shape={tuple(self.activations.shape)}"
+        )
+
+    def __len__(self):
+        return self.activations.shape[0]
+
+    def __getitem__(self, idx):
+        return self.activations[idx]
+
+
 def make_activation_loaders(
     tl_model: HookedTransformer,
     dataset: str,
@@ -260,6 +387,7 @@ def make_activation_loaders(
     max_token_blocks: Optional[int],
     val_fraction: float,
     seed: int,
+    random_control: str = "none",
 ) -> Tuple[DataLoader, DataLoader]:
     texts = get_texts(dataset, max_examples=max_examples)
 
@@ -279,6 +407,13 @@ def make_activation_loaders(
         max_token_blocks=max_token_blocks,
         token_position="all",
     )
+
+    if random_control != "none":
+        act_dataset = RandomActivationDataset(
+            reference_dataset=act_dataset,
+            seed=seed,
+            mode=random_control,
+        )
 
     if len(act_dataset) < 2:
         raise RuntimeError("Need at least 2 activation vectors to create train/val split.")
@@ -375,7 +510,187 @@ class FrozenSAEWrapper(nn.Module):
 
 
 # ============================================================
-# 4. Manifold-refined SAE
+# 4. Common SAE utilities
+# ============================================================
+
+
+def get_topk_sae_quantities(
+    sae: FrozenSAEWrapper,
+    x: torch.Tensor,
+    top_k: int,
+    normalize_decoder: bool = False,
+) -> Dict[str, torch.Tensor]:
+    """
+    Computes frozen SAE features and full/top-k reconstructions.
+
+    Returns:
+        f: [batch, d_sae]
+        f_active: [batch, k]
+        active_idx: [batch, k]
+        v_active: [batch, k, d_model]
+        x_hat_sae_full: [batch, d_model]
+        x_hat_sae_topk: [batch, d_model]
+    """
+    W_dec = sae.W_dec
+    b_dec = sae.b_dec
+
+    if normalize_decoder:
+        W_use = F.normalize(W_dec, dim=-1)
+    else:
+        W_use = W_dec
+
+    with torch.no_grad():
+        f = sae.encode(x)
+
+        x_hat_sae_full = b_dec + f @ W_use
+
+        k = min(top_k, f.shape[-1])
+        f_active, active_idx = torch.topk(
+            f,
+            k=k,
+            dim=-1,
+            largest=True,
+            sorted=False,
+        )
+
+        v_active = W_use[active_idx]
+
+        x_hat_sae_topk = b_dec + (
+            f_active[..., None] * v_active
+        ).sum(dim=1)
+
+    return {
+        "f": f,
+        "f_active": f_active,
+        "active_idx": active_idx,
+        "v_active": v_active,
+        "x_hat_sae_full": x_hat_sae_full,
+        "x_hat_sae_topk": x_hat_sae_topk,
+    }
+
+
+# ============================================================
+# 5. Scalar-rescaling baseline
+# ============================================================
+
+
+class ScalarRescaleSAE(nn.Module):
+    """
+    Baseline:
+        x_hat = b + sum_i alpha_i(x) f_i(x) v_i
+
+    This tests whether the improvement is just amplitude correction.
+    """
+
+    def __init__(
+        self,
+        sae: FrozenSAEWrapper,
+        d_model: int,
+        top_k: int = 32,
+        hidden_dim: int = 128,
+    ):
+        super().__init__()
+
+        self.sae = sae
+        self.d_model = d_model
+        self.top_k = top_k
+
+        for p in self.sae.parameters():
+            p.requires_grad = False
+
+        in_dim = 1 + d_model + d_model
+
+        self.alpha_mlp = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+        # Start as alpha = 1.
+        nn.init.zeros_(self.alpha_mlp[-1].weight)
+        nn.init.zeros_(self.alpha_mlp[-1].bias)
+
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        q = get_topk_sae_quantities(
+            sae=self.sae,
+            x=x,
+            top_k=self.top_k,
+            normalize_decoder=False,
+        )
+
+        f_active = q["f_active"]
+        v_active = q["v_active"]
+        x_hat_sae_full = q["x_hat_sae_full"]
+        x_hat_sae_topk = q["x_hat_sae_topk"]
+
+        batch, k, d_model = v_active.shape
+        x_context = x_hat_sae_full[:, None, :].expand(batch, k, d_model)
+
+        inp = torch.cat(
+            [
+                f_active[..., None],
+                v_active,
+                x_context,
+            ],
+            dim=-1,
+        )
+
+        alpha = 1.0 + 0.1 * self.alpha_mlp(inp).squeeze(-1)
+
+        x_hat_rescaled = self.sae.b_dec + (
+            alpha[..., None] * f_active[..., None] * v_active
+        ).sum(dim=1)
+
+        return {
+            **q,
+            "x_hat_rescaled": x_hat_rescaled,
+            "alpha": alpha,
+        }
+
+    def compute_loss(self, x: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        out = self.forward(x)
+
+        x_hat_rescaled = out["x_hat_rescaled"]
+        x_hat_sae_full = out["x_hat_sae_full"]
+        x_hat_sae_topk = out["x_hat_sae_topk"]
+
+        loss = F.mse_loss(x_hat_rescaled, x)
+
+        with torch.no_grad():
+            loss_sae_full = F.mse_loss(x_hat_sae_full, x)
+            loss_sae_topk = F.mse_loss(x_hat_sae_topk, x)
+
+            rel_improve_vs_topk = (
+                loss_sae_topk - loss
+            ) / loss_sae_topk.clamp_min(1e-8)
+
+            rel_improve_vs_full = (
+                loss_sae_full - loss
+            ) / loss_sae_full.clamp_min(1e-8)
+
+            mean_l0 = (out["f"] > 0).float().sum(dim=-1).mean()
+
+            alpha_abs_mean = (out["alpha"] - 1.0).abs().mean()
+            alpha_std = out["alpha"].std()
+
+        logs = {
+            "loss": loss.detach(),
+            "loss_sae_full": loss_sae_full.detach(),
+            "loss_sae_topk": loss_sae_topk.detach(),
+            "rel_improve_vs_topk": rel_improve_vs_topk.detach(),
+            "rel_improve_vs_full": rel_improve_vs_full.detach(),
+            "mean_l0": mean_l0.detach(),
+            "alpha_abs_mean": alpha_abs_mean.detach(),
+            "alpha_std": alpha_std.detach(),
+        }
+
+        return loss, logs
+
+
+# ============================================================
+# 6. Manifold-refined SAE
 # ============================================================
 
 
@@ -392,6 +707,8 @@ class ManifoldSAEConfig:
     lambda_parallel: float = 1e-3
 
     normalize_decoder: bool = False
+    use_offset_scale: bool = True
+    offset_scale_init: float = -5.0
 
 
 class OffsetMLP(nn.Module):
@@ -418,8 +735,7 @@ class OffsetMLP(nn.Module):
             nn.Linear(hidden_dim, rank),
         )
 
-        # Start from exactly zero correction.
-        # This is okay because U is random, so gradients still flow into this final layer.
+        # Start at zero correction.
         nn.init.zeros_(self.net[-1].weight)
         nn.init.zeros_(self.net[-1].bias)
 
@@ -446,8 +762,11 @@ class ManifoldRefinedSAE(nn.Module):
     Standard SAE:
         x_hat = b + sum_i f_i(x) v_i
 
-    Top-k manifold-refined model:
-        x_hat = b + sum_{i in top-k} f_i(x) [v_i + U_i z_i(x)]
+    Manifold model:
+        x_hat = b + sum_{i in topk} f_i(x) [v_i + delta_i(x)]
+        delta_i(x) = U_i z_i(x)
+
+    Here v_i is interpreted as mu_i, the mean direction of feature manifold i.
     """
 
     def __init__(self, sae: FrozenSAEWrapper, cfg: ManifoldSAEConfig):
@@ -465,42 +784,36 @@ class ManifoldRefinedSAE(nn.Module):
             hidden_dim=cfg.hidden_dim,
         )
 
+        # Feature-specific local basis.
         # Shape: [d_sae, d_model, rank].
         self.U = nn.Parameter(
             0.01 * torch.randn(cfg.d_sae, cfg.d_model, cfg.rank)
         )
 
-    def get_decoder_params(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self.sae.W_dec, self.sae.b_dec
+        if cfg.use_offset_scale:
+            self.offset_scale = nn.Parameter(torch.tensor(cfg.offset_scale_init))
+        else:
+            self.offset_scale = None
 
-    @torch.no_grad()
-    def encode_frozen(self, x: torch.Tensor) -> torch.Tensor:
-        return self.sae.encode(x)
+    def get_offset_scale(self) -> torch.Tensor:
+        if self.offset_scale is None:
+            return torch.tensor(1.0, device=self.U.device)
+        return torch.sigmoid(self.offset_scale)
 
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         cfg = self.cfg
 
-        W_dec, b_dec = self.get_decoder_params()
+        q = get_topk_sae_quantities(
+            sae=self.sae,
+            x=x,
+            top_k=cfg.top_k,
+            normalize_decoder=cfg.normalize_decoder,
+        )
 
-        if cfg.normalize_decoder:
-            W_use = F.normalize(W_dec, dim=-1)
-        else:
-            W_use = W_dec
-
-        with torch.no_grad():
-            f = self.encode_frozen(x)
-            x_hat_sae_full = b_dec + f @ W_use
-
-            k = min(cfg.top_k, f.shape[-1])
-            f_active, active_idx = torch.topk(
-                f,
-                k=k,
-                dim=-1,
-                largest=True,
-                sorted=False,
-            )
-
-        v_active = W_use[active_idx]
+        f_active = q["f_active"]
+        active_idx = q["active_idx"]
+        v_active = q["v_active"]
+        x_hat_sae_full = q["x_hat_sae_full"]
 
         z = self.offset_mlp(
             f_active=f_active,
@@ -510,25 +823,60 @@ class ManifoldRefinedSAE(nn.Module):
 
         U_active = self.U[active_idx]
 
-        delta = torch.einsum("bkdr,bkr->bkd", U_active, z)
+        delta_raw = torch.einsum("bkdr,bkr->bkd", U_active, z)
+        scale = self.get_offset_scale()
+        delta = scale * delta_raw
 
         refined_atoms = v_active + delta
 
-        x_hat_refined = b_dec + (f_active[..., None] * refined_atoms).sum(dim=1)
-
-        # Fair top-k SAE comparison.
-        x_hat_sae_topk = b_dec + (f_active[..., None] * v_active).sum(dim=1)
+        x_hat_refined = self.sae.b_dec + (
+            f_active[..., None] * refined_atoms
+        ).sum(dim=1)
 
         return {
+            **q,
             "x_hat_refined": x_hat_refined,
-            "x_hat_sae_full": x_hat_sae_full,
-            "x_hat_sae_topk": x_hat_sae_topk,
-            "f": f,
-            "f_active": f_active,
-            "active_idx": active_idx,
-            "v_active": v_active,
             "z": z,
             "delta": delta,
+            "delta_raw": delta_raw,
+            "offset_scale_value": scale.detach(),
+        }
+
+    def compute_delta_metrics(self, out: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        f_active = out["f_active"]
+        v_active = out["v_active"]
+        delta = out["delta"]
+
+        eps = 1e-8
+
+        delta_norm = delta.norm(dim=-1)
+        v_norm = v_active.norm(dim=-1).clamp_min(eps)
+
+        ratio = delta_norm / v_norm
+
+        # Weighted by f_i^2 because high-activation features matter more.
+        weights = f_active.pow(2)
+        weighted_delta_sq = (weights * delta_norm.pow(2)).sum()
+        weighted_v_sq = (weights * v_norm.pow(2)).sum().clamp_min(eps)
+        weighted_delta_over_mu = torch.sqrt(weighted_delta_sq / weighted_v_sq)
+
+        # Fraction of delta parallel to v.
+        parallel_component = (delta * v_active).sum(dim=-1) / v_norm
+        parallel_norm_ratio = parallel_component.abs() / delta_norm.clamp_min(eps)
+
+        cosine_delta_mu = (delta * v_active).sum(dim=-1) / (
+            delta_norm.clamp_min(eps) * v_norm
+        )
+
+        return {
+            "delta_over_mu_mean": ratio.mean(),
+            "delta_over_mu_median": ratio.median(),
+            "delta_over_mu_max": ratio.max(),
+            "weighted_delta_over_mu": weighted_delta_over_mu,
+            "delta_norm_mean": delta_norm.mean(),
+            "mu_norm_mean": v_norm.mean(),
+            "parallel_fraction_mean": parallel_norm_ratio.mean(),
+            "cos_delta_mu_mean": cosine_delta_mu.mean(),
         }
 
     def compute_loss(self, x: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
@@ -579,6 +927,8 @@ class ManifoldRefinedSAE(nn.Module):
 
             mean_l0 = (out["f"] > 0).float().sum(dim=-1).mean()
 
+            delta_metrics = self.compute_delta_metrics(out)
+
         logs = {
             "loss": loss.detach(),
             "loss_rec": loss_rec.detach(),
@@ -591,117 +941,184 @@ class ManifoldRefinedSAE(nn.Module):
             "rel_improve_vs_topk": rel_improve_vs_topk.detach(),
             "rel_improve_vs_full": rel_improve_vs_full.detach(),
             "mean_l0": mean_l0.detach(),
+            "offset_scale": out["offset_scale_value"].detach(),
+            **{k: v.detach() for k, v in delta_metrics.items()},
         }
 
         return loss, logs
 
 
 # ============================================================
-# 5. Scalar-rescaling baseline
+# 7. Same-size generic residual MLP adversary
 # ============================================================
 
 
-class ScalarRescaleSAE(nn.Module):
+def mlp_param_count(d_in: int, d_hidden: int, d_out: int, n_hidden_layers: int) -> int:
     """
-    Baseline:
-        x_hat = b + sum_i alpha_i(x) f_i(x) v_i
+    Count params for:
+        Linear(d_in -> h)
+        n_hidden_layers times Linear(h -> h)
+        Linear(h -> d_out)
+    """
+    total = d_in * d_hidden + d_hidden
+    for _ in range(n_hidden_layers):
+        total += d_hidden * d_hidden + d_hidden
+    total += d_hidden * d_out + d_out
+    return total
 
-    This checks whether the manifold offset is doing more than changing amplitude.
+
+def find_hidden_dim_for_target_params(
+    d_in: int,
+    d_out: int,
+    target_params: int,
+    n_hidden_layers: int,
+    max_hidden: int = 20000,
+) -> int:
+    """
+    Finds the hidden dimension whose parameter count is closest to target_params.
+    """
+    best_h = 1
+    best_diff = float("inf")
+
+    lo, hi = 1, max_hidden
+
+    # Binary-ish search to get near target.
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        c = mlp_param_count(d_in, mid, d_out, n_hidden_layers)
+        diff = abs(c - target_params)
+
+        if diff < best_diff:
+            best_diff = diff
+            best_h = mid
+
+        if c < target_params:
+            lo = mid + 1
+        else:
+            hi = mid - 1
+
+    # Local refine.
+    for h in range(max(1, best_h - 10), min(max_hidden, best_h + 10) + 1):
+        c = mlp_param_count(d_in, h, d_out, n_hidden_layers)
+        diff = abs(c - target_params)
+        if diff < best_diff:
+            best_diff = diff
+            best_h = h
+
+    return best_h
+
+
+class CapacityMatchedResidualMLP(nn.Module):
+    """
+    Same-size adversary baseline.
+
+    It predicts a generic residual vector rather than feature-local deltas:
+
+        x_hat = x_hat_sae_topk + g(x_hat_sae_full, x_hat_sae_topk)
+
+    This tests whether the manifold result is just from adding ~same number of
+    trainable parameters.
+
+    It has no explicit feature-wise delta_i = U_i z_i geometry.
     """
 
     def __init__(
         self,
         sae: FrozenSAEWrapper,
         d_model: int,
-        top_k: int = 32,
-        hidden_dim: int = 128,
+        top_k: int,
+        target_params: int,
+        n_hidden_layers: int = 1,
+        hidden_dim: Optional[int] = None,
+        residual_scale_init: float = -5.0,
     ):
         super().__init__()
 
         self.sae = sae
         self.d_model = d_model
         self.top_k = top_k
+        self.n_hidden_layers = n_hidden_layers
 
         for p in self.sae.parameters():
             p.requires_grad = False
 
-        in_dim = 1 + d_model + d_model
+        d_in = 2 * d_model
+        d_out = d_model
 
-        self.alpha_mlp = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, 1),
-        )
-
-        # Start as alpha = 1 exactly.
-        nn.init.zeros_(self.alpha_mlp[-1].weight)
-        nn.init.zeros_(self.alpha_mlp[-1].bias)
-
-    @torch.no_grad()
-    def encode_frozen(self, x: torch.Tensor) -> torch.Tensor:
-        return self.sae.encode(x)
-
-    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
-        W_dec = self.sae.W_dec
-        b_dec = self.sae.b_dec
-
-        with torch.no_grad():
-            f = self.encode_frozen(x)
-            x_hat_sae_full = b_dec + f @ W_dec
-
-            k = min(self.top_k, f.shape[-1])
-            f_active, active_idx = torch.topk(
-                f,
-                k=k,
-                dim=-1,
-                largest=True,
-                sorted=False,
+        if hidden_dim is None:
+            hidden_dim = find_hidden_dim_for_target_params(
+                d_in=d_in,
+                d_out=d_out,
+                target_params=target_params,
+                n_hidden_layers=n_hidden_layers,
             )
 
-        v_active = W_dec[active_idx]
+        self.hidden_dim = hidden_dim
 
-        batch, k, d_model = v_active.shape
-        x_context = x_hat_sae_full[:, None, :].expand(batch, k, d_model)
+        layers: List[nn.Module] = []
+        layers.append(nn.Linear(d_in, hidden_dim))
+        layers.append(nn.GELU())
 
-        inp = torch.cat(
-            [
-                f_active[..., None],
-                v_active,
-                x_context,
-            ],
-            dim=-1,
+        for _ in range(n_hidden_layers):
+            layers.append(nn.Linear(hidden_dim, hidden_dim))
+            layers.append(nn.GELU())
+
+        layers.append(nn.Linear(hidden_dim, d_out))
+
+        self.net = nn.Sequential(*layers)
+
+        # Start near zero residual.
+        last_linear = self.net[-1]
+        assert isinstance(last_linear, nn.Linear)
+        nn.init.zeros_(last_linear.weight)
+        nn.init.zeros_(last_linear.bias)
+
+        self.residual_scale = nn.Parameter(torch.tensor(residual_scale_init))
+
+        actual_params = count_trainable_params(self)
+        print(
+            f"CapacityMatchedResidualMLP: target_params={target_params:,}, "
+            f"hidden_dim={hidden_dim:,}, actual_trainable_params={actual_params:,}"
         )
 
-        alpha = 1.0 + 0.1 * self.alpha_mlp(inp).squeeze(-1)
+    def get_residual_scale(self) -> torch.Tensor:
+        return torch.sigmoid(self.residual_scale)
 
-        x_hat_rescaled = b_dec + (
-            alpha[..., None] * f_active[..., None] * v_active
-        ).sum(dim=1)
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        q = get_topk_sae_quantities(
+            sae=self.sae,
+            x=x,
+            top_k=self.top_k,
+            normalize_decoder=False,
+        )
 
-        x_hat_sae_topk = b_dec + (
-            f_active[..., None] * v_active
-        ).sum(dim=1)
+        x_hat_sae_full = q["x_hat_sae_full"]
+        x_hat_sae_topk = q["x_hat_sae_topk"]
+
+        inp = torch.cat([x_hat_sae_full, x_hat_sae_topk], dim=-1)
+
+        residual_raw = self.net(inp)
+        scale = self.get_residual_scale()
+        residual = scale * residual_raw
+
+        x_hat_residual = x_hat_sae_topk + residual
 
         return {
-            "x_hat_rescaled": x_hat_rescaled,
-            "x_hat_sae_full": x_hat_sae_full,
-            "x_hat_sae_topk": x_hat_sae_topk,
-            "alpha": alpha,
-            "active_idx": active_idx,
-            "f_active": f_active,
-            "f": f,
+            **q,
+            "x_hat_residual": x_hat_residual,
+            "residual": residual,
+            "residual_raw": residual_raw,
+            "residual_scale_value": scale.detach(),
         }
 
     def compute_loss(self, x: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         out = self.forward(x)
 
-        x_hat_rescaled = out["x_hat_rescaled"]
+        x_hat_residual = out["x_hat_residual"]
         x_hat_sae_full = out["x_hat_sae_full"]
         x_hat_sae_topk = out["x_hat_sae_topk"]
 
-        loss = F.mse_loss(x_hat_rescaled, x)
+        loss = F.mse_loss(x_hat_residual, x)
 
         with torch.no_grad():
             loss_sae_full = F.mse_loss(x_hat_sae_full, x)
@@ -715,6 +1132,10 @@ class ScalarRescaleSAE(nn.Module):
                 loss_sae_full - loss
             ) / loss_sae_full.clamp_min(1e-8)
 
+            residual_norm = out["residual"].norm(dim=-1)
+            topk_norm = x_hat_sae_topk.norm(dim=-1).clamp_min(1e-8)
+            residual_over_topk = (residual_norm / topk_norm).mean()
+
             mean_l0 = (out["f"] > 0).float().sum(dim=-1).mean()
 
         logs = {
@@ -723,6 +1144,8 @@ class ScalarRescaleSAE(nn.Module):
             "loss_sae_topk": loss_sae_topk.detach(),
             "rel_improve_vs_topk": rel_improve_vs_topk.detach(),
             "rel_improve_vs_full": rel_improve_vs_full.detach(),
+            "residual_over_topk_mean": residual_over_topk.detach(),
+            "residual_scale": out["residual_scale_value"].detach(),
             "mean_l0": mean_l0.detach(),
         }
 
@@ -730,7 +1153,7 @@ class ScalarRescaleSAE(nn.Module):
 
 
 # ============================================================
-# 6. Training / evaluation
+# 8. Training / evaluation
 # ============================================================
 
 
@@ -767,7 +1190,7 @@ def evaluate_model(
         _, logs = model.compute_loss(x)
 
         for k, v in logs.items():
-            val = v.item() if torch.is_tensor(v) else float(v)
+            val = scalar(v)
             totals[k] = totals.get(k, 0.0) + val
 
         n += 1
@@ -785,6 +1208,7 @@ def train_model(
     device: str,
     log_every: int,
     save_path: Optional[str] = None,
+    model_name: str = "model",
 ) -> nn.Module:
     if len(train_loader) == 0:
         raise RuntimeError("train_loader has zero batches.")
@@ -805,6 +1229,8 @@ def train_model(
     step = 0
     best_val = math.inf
 
+    print_param_count(model_name, model)
+
     for epoch in range(num_epochs):
         model.train()
 
@@ -820,16 +1246,20 @@ def train_model(
 
             if step % log_every == 0:
                 metric_dict = {
-                    k: v.item() if torch.is_tensor(v) else float(v)
+                    k: scalar(v)
                     for k, v in logs.items()
                 }
-                print(f"epoch={epoch} step={step} {format_metrics(metric_dict)}")
+                print(
+                    f"[{model_name}] "
+                    f"epoch={epoch} step={step} "
+                    f"{format_metrics(metric_dict)}"
+                )
 
             step += 1
 
         if val_loader is not None:
             metrics = evaluate_model(model, val_loader, device=device)
-            print(f"[val epoch={epoch}] {format_metrics(metrics)}")
+            print(f"[{model_name} val epoch={epoch}] {format_metrics(metrics)}")
 
             val_loss = metrics.get("loss", math.inf)
 
@@ -841,13 +1271,13 @@ def train_model(
                     os.makedirs(save_dir, exist_ok=True)
 
                 torch.save(model.state_dict(), save_path)
-                print(f"Saved best model to {save_path}")
+                print(f"[{model_name}] Saved best model to {save_path}")
 
     return model
 
 
 # ============================================================
-# 7. Loading model / SAE
+# 9. Loading model / SAE
 # ============================================================
 
 
@@ -895,7 +1325,179 @@ def infer_hook_name(sae: FrozenSAEWrapper, fallback_sae_id: str) -> str:
 
 
 # ============================================================
-# 8. Main experiment
+# 10. Summary logic
+# ============================================================
+
+
+def summarize_experiment(
+    args: argparse.Namespace,
+    scalar_metrics: Optional[Dict[str, float]],
+    residual_metrics: Optional[Dict[str, float]],
+    manifold_metrics: Optional[Dict[str, float]],
+    train_batches: int,
+    val_batches: int,
+    scalar_params: Optional[int],
+    residual_params: Optional[int],
+    manifold_params: Optional[int],
+) -> None:
+    print("\n" + "=" * 90)
+    print("CONCRETE EXPERIMENT SUMMARY")
+    print("=" * 90)
+
+    print("\nSetup:")
+    print(f"  dataset:              {args.dataset}")
+    print(f"  random_control:       {args.random_control}")
+    print(f"  model_name:           {args.model_name}")
+    print(f"  release:              {args.release}")
+    print(f"  sae_id:               {args.sae_id}")
+    print(f"  top_k:                {args.top_k}")
+    print(f"  rank:                 {args.rank}")
+    print(f"  num_epochs:           {args.num_epochs}")
+    print(f"  lr:                   {args.lr}")
+    print(f"  train_batches:        {train_batches}")
+    print(f"  val_batches:          {val_batches}")
+
+    print("\nTrainable parameter counts:")
+    if scalar_params is not None:
+        print(f"  scalar baseline:      {scalar_params:,}")
+    if residual_params is not None:
+        print(f"  residual adversary:   {residual_params:,}")
+    if manifold_params is not None:
+        print(f"  manifold model:       {manifold_params:,}")
+
+    print("\nFinal validation metrics:")
+    header = (
+        "model              | loss       | vs_full    | vs_topk    | "
+        "sae_full  | sae_topk"
+    )
+    print(header)
+    print("-" * len(header))
+
+    def print_row(name: str, m: Optional[Dict[str, float]]) -> None:
+        if m is None:
+            return
+        print(
+            f"{name:<18} | "
+            f"{m.get('loss', float('nan')):>10.6g} | "
+            f"{m.get('rel_improve_vs_full', float('nan')):>10.6g} | "
+            f"{m.get('rel_improve_vs_topk', float('nan')):>10.6g} | "
+            f"{m.get('loss_sae_full', float('nan')):>8.6g} | "
+            f"{m.get('loss_sae_topk', float('nan')):>8.6g}"
+        )
+
+    print_row("scalar", scalar_metrics)
+    print_row("residual_adv", residual_metrics)
+    print_row("manifold", manifold_metrics)
+
+    if manifold_metrics is not None:
+        print("\nManifold delta diagnostics:")
+        keys = [
+            "delta_over_mu_mean",
+            "delta_over_mu_median",
+            "delta_over_mu_max",
+            "weighted_delta_over_mu",
+            "delta_norm_mean",
+            "mu_norm_mean",
+            "parallel_fraction_mean",
+            "cos_delta_mu_mean",
+            "offset_scale",
+        ]
+        for k in keys:
+            if k in manifold_metrics:
+                print(f"  {k:<28}: {manifold_metrics[k]:.6g}")
+
+    print("\nInterpretation:")
+
+    if args.random_control != "none":
+        print(
+            "  This was a RANDOM CONTROL run. The key question is whether the "
+            "manifold model still improves strongly when real activation geometry is destroyed."
+        )
+        if manifold_metrics is not None:
+            mvf = manifold_metrics.get("rel_improve_vs_full", float("nan"))
+            mvt = manifold_metrics.get("rel_improve_vs_topk", float("nan"))
+            print(f"  manifold.rel_improve_vs_full = {mvf:.6g}")
+            print(f"  manifold.rel_improve_vs_topk = {mvt:.6g}")
+            if mvf > 0.2:
+                print(
+                    "  WARNING: large improvement on random-control data. This suggests "
+                    "capacity/overfitting may explain a significant part of the effect."
+                )
+            elif mvf > 0.05:
+                print(
+                    "  MODERATE WARNING: random-control improvement is nontrivial. "
+                    "Compare against the real-activation run."
+                )
+            else:
+                print(
+                    "  GOOD SIGN: random-control improvement is small. This supports "
+                    "the idea that real activation geometry matters."
+                )
+
+    else:
+        if manifold_metrics is not None and scalar_metrics is not None:
+            s = scalar_metrics.get("rel_improve_vs_full", float("nan"))
+            m = manifold_metrics.get("rel_improve_vs_full", float("nan"))
+            gap = m - s
+            print(f"  manifold_vs_full - scalar_vs_full = {gap:.6g}")
+            if gap > 0.1:
+                print(
+                    "  The manifold model beats scalar rescaling by a substantial margin. "
+                    "This suggests the improvement is not merely amplitude correction."
+                )
+            else:
+                print(
+                    "  The manifold model does not clearly beat scalar rescaling. "
+                    "This weakens the feature-manifold interpretation."
+                )
+
+        if manifold_metrics is not None and residual_metrics is not None:
+            m = manifold_metrics.get("rel_improve_vs_full", float("nan"))
+            r = residual_metrics.get("rel_improve_vs_full", float("nan"))
+            gap = m - r
+            print(f"  manifold_vs_full - residual_adversary_vs_full = {gap:.6g}")
+            if gap > 0.05:
+                print(
+                    "  The manifold model beats the same-size generic residual adversary. "
+                    "This supports feature-local structure over pure capacity."
+                )
+            elif gap < -0.05:
+                print(
+                    "  The same-size generic residual adversary beats the manifold model. "
+                    "This suggests capacity may be the main driver."
+                )
+            else:
+                print(
+                    "  The manifold model and same-size residual adversary are similar. "
+                    "This is ambiguous: capacity may explain much of the gain."
+                )
+
+        if manifold_metrics is not None:
+            ratio = manifold_metrics.get("weighted_delta_over_mu", float("nan"))
+            if ratio < 0.1:
+                print(
+                    "  weighted_delta_over_mu is small. This supports a local-correction "
+                    "interpretation."
+                )
+            elif ratio < 0.5:
+                print(
+                    "  weighted_delta_over_mu is moderate. The manifold interpretation is "
+                    "plausible, but the offsets are not tiny."
+                )
+            else:
+                print(
+                    "  weighted_delta_over_mu is large. The model may be replacing SAE "
+                    "features rather than making small local manifold corrections."
+                )
+
+    print("\nRecommended next comparison:")
+    print("  Run the same command with --random-control shuffle_dims.")
+    print("  Then compare real manifold.rel_improve_vs_full against random-control manifold.rel_improve_vs_full.")
+    print("=" * 90)
+
+
+# ============================================================
+# 11. Main experiment
 # ============================================================
 
 
@@ -905,55 +1507,51 @@ def run(args: argparse.Namespace) -> None:
     device = args.device or get_device()
     print(f"Using device: {device}")
 
-    # Load GPT-2 / TransformerLens model only once.
-    print(f"Loading TransformerLens model: {args.model_name}")
-    tl_model = HookedTransformer.from_pretrained(args.model_name, device=device)
-    tl_model.eval()
+    tl_model, sae, cfg_dict = load_model_and_sae(
+        model_name=args.model_name,
+        release=args.release,
+        sae_id=args.sae_id,
+        device=device,
+    )
 
-    all_results = []
+    hook_name = infer_hook_name(sae, args.sae_id)
+    print(f"Using hook_name: {hook_name}")
 
-    for layer_idx in range(args.layer_start, args.layer_end + 1):
-        sae_id = args.sae_id_template.format(layer=layer_idx)
+    d_sae, d_model = infer_dims(sae)
+    print(f"SAE dimensions: d_sae={d_sae}, d_model={d_model}")
 
+    train_loader, val_loader = make_activation_loaders(
+        tl_model=tl_model,
+        dataset=args.dataset,
+        hook_name=hook_name,
+        seq_len=args.seq_len,
+        token_batch_size=args.token_batch_size,
+        activation_batch_size=args.activation_batch_size,
+        device=device,
+        max_examples=args.max_examples,
+        max_tokens=args.max_tokens,
+        max_token_blocks=args.max_token_blocks,
+        val_fraction=args.val_fraction,
+        seed=args.seed,
+        random_control=args.random_control,
+    )
+
+    scalar_metrics = None
+    residual_metrics = None
+    manifold_metrics = None
+
+    scalar_params = None
+    residual_params = None
+    manifold_params = None
+
+    # ------------------------------------------------------------
+    # Scalar baseline
+    # ------------------------------------------------------------
+
+    if not args.skip_scalar:
         print("\n" + "=" * 80)
-        print(f"Layer {layer_idx}: loading SAE {sae_id}")
+        print("Training scalar-rescaling baseline")
         print("=" * 80)
-
-        sae_raw, cfg_dict, sparsity = SAE.from_pretrained(
-            release=args.release,
-            sae_id=sae_id,
-            device=device,
-        )
-        sae_raw.eval()
-
-        sae = FrozenSAEWrapper(sae_raw)
-
-        hook_name = infer_hook_name(sae, sae_id)
-        d_sae, d_model = infer_dims(sae)
-
-        print(f"Layer {layer_idx}: hook_name={hook_name}")
-        print(f"Layer {layer_idx}: d_sae={d_sae}, d_model={d_model}")
-
-        train_loader, val_loader = make_activation_loaders(
-            tl_model=tl_model,
-            dataset=args.dataset,
-            hook_name=hook_name,
-            seq_len=args.seq_len,
-            token_batch_size=args.token_batch_size,
-            activation_batch_size=args.activation_batch_size,
-            device=device,
-            max_examples=args.max_examples,
-            max_tokens=args.max_tokens,
-            max_token_blocks=args.max_token_blocks,
-            val_fraction=args.val_fraction,
-            seed=args.seed,
-        )
-
-        # ------------------------------------------------------------
-        # Scalar baseline for this layer
-        # ------------------------------------------------------------
-
-        print(f"\nTraining scalar-rescaling baseline for layer {layer_idx}...")
 
         scalar_model = ScalarRescaleSAE(
             sae=sae,
@@ -962,7 +1560,7 @@ def run(args: argparse.Namespace) -> None:
             hidden_dim=args.scalar_hidden_dim,
         )
 
-        scalar_save_path = args.scalar_save_path_template.format(layer=layer_idx)
+        scalar_params = count_trainable_params(scalar_model)
 
         train_model(
             model=scalar_model,
@@ -973,7 +1571,8 @@ def run(args: argparse.Namespace) -> None:
             num_epochs=args.num_epochs,
             device=device,
             log_every=args.log_every,
-            save_path=scalar_save_path,
+            save_path=args.scalar_save_path,
+            model_name="scalar",
         )
 
         scalar_metrics = evaluate_model(
@@ -982,35 +1581,67 @@ def run(args: argparse.Namespace) -> None:
             device=device,
         )
 
-        print(f"[layer {layer_idx} final scalar] {format_metrics(scalar_metrics)}")
+        print(f"[final scalar] {format_metrics(scalar_metrics)}")
 
-        # ------------------------------------------------------------
-        # Manifold model for this layer
-        # ------------------------------------------------------------
+        del scalar_model
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
-        print(f"\nTraining manifold-refined SAE for layer {layer_idx}...")
+    # ------------------------------------------------------------
+    # Manifold model
+    # ------------------------------------------------------------
 
-        manifold_cfg = ManifoldSAEConfig(
-            d_model=d_model,
-            d_sae=d_sae,
-            top_k=args.top_k,
-            rank=args.rank,
-            hidden_dim=args.manifold_hidden_dim,
-            lambda_delta=args.lambda_delta,
-            lambda_z=args.lambda_z,
-            lambda_parallel=args.lambda_parallel,
-            normalize_decoder=args.normalize_decoder,
-        )
+    print("\n" + "=" * 80)
+    print("Building manifold-refined SAE")
+    print("=" * 80)
 
-        manifold_model = ManifoldRefinedSAE(
+    manifold_cfg = ManifoldSAEConfig(
+        d_model=d_model,
+        d_sae=d_sae,
+        top_k=args.top_k,
+        rank=args.rank,
+        hidden_dim=args.manifold_hidden_dim,
+        lambda_delta=args.lambda_delta,
+        lambda_z=args.lambda_z,
+        lambda_parallel=args.lambda_parallel,
+        normalize_decoder=args.normalize_decoder,
+        use_offset_scale=not args.disable_offset_scale,
+        offset_scale_init=args.offset_scale_init,
+    )
+
+    manifold_model = ManifoldRefinedSAE(
+        sae=sae,
+        cfg=manifold_cfg,
+    )
+
+    manifold_params = count_trainable_params(manifold_model)
+
+    print_param_count("manifold", manifold_model)
+
+    # ------------------------------------------------------------
+    # Same-size residual adversary
+    # ------------------------------------------------------------
+
+    if not args.skip_residual_adversary:
+        print("\n" + "=" * 80)
+        print("Training same-size generic residual MLP adversary")
+        print("=" * 80)
+
+        residual_model = CapacityMatchedResidualMLP(
             sae=sae,
-            cfg=manifold_cfg,
+            d_model=d_model,
+            top_k=args.top_k,
+            target_params=manifold_params,
+            n_hidden_layers=args.residual_hidden_layers,
+            hidden_dim=args.residual_hidden_dim,
+            residual_scale_init=args.residual_scale_init,
         )
 
-        manifold_save_path = args.manifold_save_path_template.format(layer=layer_idx)
+        residual_params = count_trainable_params(residual_model)
 
         train_model(
-            model=manifold_model,
+            model=residual_model,
             train_loader=train_loader,
             val_loader=val_loader,
             lr=args.lr,
@@ -1018,81 +1649,67 @@ def run(args: argparse.Namespace) -> None:
             num_epochs=args.num_epochs,
             device=device,
             log_every=args.log_every,
-            save_path=manifold_save_path,
+            save_path=args.residual_save_path,
+            model_name="residual_adv",
         )
 
-        manifold_metrics = evaluate_model(
-            manifold_model,
+        residual_metrics = evaluate_model(
+            residual_model,
             val_loader,
             device=device,
         )
 
-        print(f"[layer {layer_idx} final manifold] {format_metrics(manifold_metrics)}")
+        print(f"[final residual_adv] {format_metrics(residual_metrics)}")
 
-        result = {
-            "layer": layer_idx,
-            "sae_id": sae_id,
-            "hook_name": hook_name,
-            "scalar_rel_improve_vs_full": scalar_metrics.get("rel_improve_vs_full", float("nan")),
-            "scalar_rel_improve_vs_topk": scalar_metrics.get("rel_improve_vs_topk", float("nan")),
-            "manifold_rel_improve_vs_full": manifold_metrics.get("rel_improve_vs_full", float("nan")),
-            "manifold_rel_improve_vs_topk": manifold_metrics.get("rel_improve_vs_topk", float("nan")),
-            "scalar_loss": scalar_metrics.get("loss", float("nan")),
-            "manifold_loss": manifold_metrics.get("loss", float("nan")),
-            "sae_full_loss": manifold_metrics.get("loss_sae_full", float("nan")),
-            "sae_topk_loss": manifold_metrics.get("loss_sae_topk", float("nan")),
-            "mean_l0": manifold_metrics.get("mean_l0", float("nan")),
-        }
-
-        all_results.append(result)
-
-        print("\nLayer result:")
-        for k, v in result.items():
-            print(f"  {k}: {v}")
-
-        # Clear memory before next layer.
-        del sae_raw
-        del sae
-        del scalar_model
-        del manifold_model
-        del train_loader
-        del val_loader
-
+        del residual_model
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
     # ------------------------------------------------------------
-    # Final summary table
+    # Train manifold model
     # ------------------------------------------------------------
 
     print("\n" + "=" * 80)
-    print("All-layer summary")
+    print("Training manifold-refined SAE")
     print("=" * 80)
 
-    header = (
-        "layer | scalar_vs_full | manifold_vs_full | "
-        "scalar_vs_topk | manifold_vs_topk | sae_full_loss | sae_topk_loss | mean_l0"
+    train_model(
+        model=manifold_model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        num_epochs=args.num_epochs,
+        device=device,
+        log_every=args.log_every,
+        save_path=args.manifold_save_path,
+        model_name="manifold",
     )
-    print(header)
-    print("-" * len(header))
 
-    for r in all_results:
-        print(
-            f"{r['layer']:>5} | "
-            f"{r['scalar_rel_improve_vs_full']:>14.6g} | "
-            f"{r['manifold_rel_improve_vs_full']:>16.6g} | "
-            f"{r['scalar_rel_improve_vs_topk']:>14.6g} | "
-            f"{r['manifold_rel_improve_vs_topk']:>16.6g} | "
-            f"{r['sae_full_loss']:>13.6g} | "
-            f"{r['sae_topk_loss']:>13.6g} | "
-            f"{r['mean_l0']:>7.4g}"
-        )
+    manifold_metrics = evaluate_model(
+        manifold_model,
+        val_loader,
+        device=device,
+    )
 
-    print("\nDone.")
+    print(f"[final manifold] {format_metrics(manifold_metrics)}")
+
+    summarize_experiment(
+        args=args,
+        scalar_metrics=scalar_metrics,
+        residual_metrics=residual_metrics,
+        manifold_metrics=manifold_metrics,
+        train_batches=len(train_loader),
+        val_batches=len(val_loader),
+        scalar_params=scalar_params,
+        residual_params=residual_params,
+        manifold_params=manifold_params,
+    )
+
 
 # ============================================================
-# 9. CLI
+# 12. CLI
 # ============================================================
 
 
@@ -1108,41 +1725,63 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument(
         "--dataset",
         type=str,
-        default="tinyshakespeare",
+        default="tinystories",
         choices=["tinyshakespeare", "tinystories"],
     )
     p.add_argument("--seq-len", type=int, default=128)
-    p.add_argument("--max-examples", type=int, default=None)
+    p.add_argument("--max-examples", type=int, default=20000)
     p.add_argument("--max-tokens", type=int, default=2_000_000)
-    p.add_argument("--max-token-blocks", type=int, default=1024)
+    p.add_argument("--max-token-blocks", type=int, default=8192)
     p.add_argument("--val-fraction", type=float, default=0.05)
+
+    # Random controls
+    p.add_argument(
+        "--random-control",
+        type=str,
+        default="none",
+        choices=["none", "gaussian", "shuffle_dims", "permute_examples"],
+    )
 
     # Batch sizes
     p.add_argument("--token-batch-size", type=int, default=8)
-    p.add_argument("--activation-batch-size", type=int, default=256)
+    p.add_argument("--activation-batch-size", type=int, default=512)
 
     # Architecture
-    p.add_argument("--top-k", type=int, default=32)
+    p.add_argument("--top-k", type=int, default=64)
     p.add_argument("--rank", type=int, default=4)
     p.add_argument("--manifold-hidden-dim", type=int, default=256)
     p.add_argument("--scalar-hidden-dim", type=int, default=128)
 
-    # Loss
-    p.add_argument("--lambda-delta", type=float, default=1e-3)
-    p.add_argument("--lambda-z", type=float, default=1e-4)
-    p.add_argument("--lambda-parallel", type=float, default=1e-3)
+    # Manifold loss
+    p.add_argument("--lambda-delta", type=float, default=1e-2)
+    p.add_argument("--lambda-z", type=float, default=1e-3)
+    p.add_argument("--lambda-parallel", type=float, default=1e-2)
     p.add_argument("--normalize-decoder", action="store_true")
 
+    # Offset scaling
+    p.add_argument("--disable-offset-scale", action="store_true")
+    p.add_argument("--offset-scale-init", type=float, default=-5.0)
+
+    # Residual adversary
+    p.add_argument("--skip-residual-adversary", action="store_true")
+    p.add_argument("--residual-hidden-layers", type=int, default=1)
+    p.add_argument("--residual-hidden-dim", type=int, default=None)
+    p.add_argument("--residual-scale-init", type=float, default=-5.0)
+
+    # Scalar
+    p.add_argument("--skip-scalar", action="store_true")
+
     # Optimization
-    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight-decay", type=float, default=1e-4)
-    p.add_argument("--num-epochs", type=int, default=3)
-    p.add_argument("--log-every", type=int, default=10)
+    p.add_argument("--num-epochs", type=int, default=5)
+    p.add_argument("--log-every", type=int, default=100)
 
     # Misc
     p.add_argument("--device", type=str, default=None)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--scalar-save-path", type=str, default="checkpoints/scalar_rescale.pt")
+    p.add_argument("--residual-save-path", type=str, default="checkpoints/residual_adversary.pt")
     p.add_argument("--manifold-save-path", type=str, default="checkpoints/manifold_refined.pt")
 
     return p
