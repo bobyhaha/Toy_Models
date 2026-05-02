@@ -245,18 +245,34 @@ def make_activation_loaders(
     generator = torch.Generator().manual_seed(seed)
     train_set, val_set = random_split(act_dataset, [n_train, n_val], generator=generator)
 
+    print(
+        f\"Activation dataset sizes: total={len(act_dataset)}, \"
+        f\"train={len(train_set)}, val={len(val_set)}, \"
+        f\"activation_batch_size={activation_batch_size}\"
+    )
+
+    # Important: do NOT use drop_last=True here for pilot experiments.
+    # If the activation dataset has fewer examples than activation_batch_size,
+    # drop_last=True silently creates a train_loader with zero batches.
     train_loader = DataLoader(
         train_set,
-        batch_size=activation_batch_size,
+        batch_size=min(activation_batch_size, max(1, len(train_set))),
         shuffle=True,
-        drop_last=True,
+        drop_last=False,
     )
     val_loader = DataLoader(
         val_set,
-        batch_size=activation_batch_size,
+        batch_size=min(activation_batch_size, max(1, len(val_set))),
         shuffle=False,
         drop_last=False,
     )
+
+    print(f\"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}\")
+    if len(train_loader) == 0:
+        raise RuntimeError(
+            \"train_loader has zero batches. Increase --max-token-blocks, \"
+            \"increase --max-tokens, or reduce --activation-batch-size.\"
+        )
 
     return train_loader, val_loader
 
@@ -823,12 +839,12 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--seq-len", type=int, default=128)
     p.add_argument("--max-examples", type=int, default=None)
     p.add_argument("--max-tokens", type=int, default=2_000_000)
-    p.add_argument("--max-token-blocks", type=int, default=256)
+    p.add_argument("--max-token-blocks", type=int, default=1024)
     p.add_argument("--val-fraction", type=float, default=0.05)
 
     # Batches
     p.add_argument("--token-batch-size", type=int, default=8)
-    p.add_argument("--activation-batch-size", type=int, default=1024)
+    p.add_argument("--activation-batch-size", type=int, default=256)
 
     # Model hyperparams
     p.add_argument("--top-k", type=int, default=32)
