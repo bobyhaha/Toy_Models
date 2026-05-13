@@ -1,6 +1,7 @@
 import argparse
 from pathlib import Path
 import json
+from datetime import datetime
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
@@ -16,23 +17,36 @@ def evaluate(model, loader, device):
     model.eval()
     total_loss = 0.0
     total_tokens = 0
+    correct_tokens = 0
+    exact_sequences = 0
+    total_sequences = 0
     for batch in loader:
         input_ids = batch["input_ids"].to(device)
         labels = batch["labels"].to(device)
         logits = model(input_ids)
         loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), labels.reshape(-1), ignore_index=-100, reduction="sum")
-        n = (labels != -100).sum().item()
+        mask = labels != -100
+        preds = logits.argmax(dim=-1)
+        n = mask.sum().item()
         total_loss += loss.item()
         total_tokens += n
+        correct_tokens += ((preds == labels) & mask).sum().item()
+        exact_sequences += (((preds == labels) | ~mask).all(dim=1)).sum().item()
+        total_sequences += labels.size(0)
     model.train()
-    return total_loss / max(total_tokens, 1)
+    return {
+        "loss": total_loss / max(total_tokens, 1),
+        "token_accuracy": correct_tokens / max(total_tokens, 1),
+        "exact_match": exact_sequences / max(total_sequences, 1),
+    }
 
-def save_checkpoint(path, model, optimizer, step, model_cfg, train_cfg, tokenizer):
+def save_checkpoint(path, model, optimizer, step, model_cfg, train_cfg, tokenizer, run_id):
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save({
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "step": step,
+        "run_id": run_id,
         "model_cfg": model_cfg.__dict__,
         "train_cfg": train_cfg.__dict__,
         "vocab": tokenizer.itos,
@@ -71,7 +85,10 @@ def main():
 
     out_dir = Path("checkpoints") / args.task
     metrics_path = out_dir / "metrics.jsonl"
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir.mkdir(parents=True, exist_ok=True)
+    metrics_path.write_text("")
+    (out_dir / "latest_run.txt").write_text(run_id)
 
     step = 0
     pbar = tqdm(total=train_cfg.steps)
@@ -90,20 +107,31 @@ def main():
             optimizer.step()
 
             if step % train_cfg.eval_every == 0 or step == 1:
-                test_loss = evaluate(model, test_loader, args.device)
-                row = {"step": step, "train_loss": float(loss.item()), "test_loss": float(test_loss)}
+                test_metrics = evaluate(model, test_loader, args.device)
+                row = {
+                    "run_id": run_id,
+                    "experiment": "experiment 1",
+                    "step": step,
+                    "train_loss": float(loss.item()),
+                    "test_loss": float(test_metrics["loss"]),
+                    "test_token_accuracy": float(test_metrics["token_accuracy"]),
+                    "test_exact_match": float(test_metrics["exact_match"]),
+                }
                 with metrics_path.open("a") as f:
                     f.write(json.dumps(row) + "\n")
-                pbar.set_description(f"{args.task} loss {loss.item():.4f} test {test_loss:.4f}")
+                pbar.set_description(
+                    f"{args.task} loss {loss.item():.4f} "
+                    f"test {test_metrics['loss']:.4f} acc {test_metrics['token_accuracy']:.3f}"
+                )
 
             if step % train_cfg.save_every == 0 or step == 1:
-                save_checkpoint(out_dir / f"step_{step}.pt", model, optimizer, step, model_cfg, train_cfg, tok)
+                save_checkpoint(out_dir / f"step_{step}.pt", model, optimizer, step, model_cfg, train_cfg, tok, run_id)
 
             pbar.update(1)
             if step >= train_cfg.steps:
                 break
 
-    save_checkpoint(out_dir / f"step_{step}.pt", model, optimizer, step, model_cfg, train_cfg, tok)
+    save_checkpoint(out_dir / f"step_{step}.pt", model, optimizer, step, model_cfg, train_cfg, tok, run_id)
     pbar.close()
 
 if __name__ == "__main__":

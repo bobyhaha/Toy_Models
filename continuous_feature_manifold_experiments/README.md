@@ -12,7 +12,7 @@ Tasks:
 
 Main analyses:
 - Train a small decoder-only transformer on decimal-string regression.
-- Save checkpoints during training.
+- Save checkpoints during training every 100 steps.
 - Collect residual stream activations at the position right before generating y.
 - Measure whether h(x) becomes smooth and low-dimensional over training.
 - Train sparse autoencoders on h(x).
@@ -42,6 +42,18 @@ Analyze checkpoints:
 
 ```bash
 python analyze_geometry.py --task sin --device cuda
+```
+
+Interactive PCA over the latest training run:
+
+```bash
+python interactive_pca.py --task sin --device cuda
+```
+
+Compare Experiment 1 cluster formation against model accuracy:
+
+```bash
+python compare_cluster_accuracy.py --task sin --device cuda
 ```
 
 Train SAE:

@@ -16,7 +16,7 @@ class TrainConfig:
     weight_decay: float = 1e-2
     steps: int = 20000
     eval_every: int = 500
-    save_every: int = 1000
+    save_every: int = 100
     precision: int = 3
     x_min: float = -3.14159
     x_max: float = 3.14159

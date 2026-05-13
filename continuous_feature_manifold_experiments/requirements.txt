@@ -1,6 +1,7 @@
 torch
 numpy
 matplotlib
+plotly
 scikit-learn
 scipy
 tqdm
