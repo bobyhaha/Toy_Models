@@ -38,6 +38,16 @@ Or train one task:
 python train_transformer.py --task sin --steps 20000 --device cuda
 ```
 
+Train one mixed model on all four tasks at once:
+
+```bash
+python train_transformer.py --task all --steps 20000 --device cuda
+```
+
+For `--task all`, each input includes a numeric task label before the function
+input, for example `x=2;x=1.234;y=`. The mixed dataset is randomly shuffled
+across `identity`, `square`, `sin`, and `gaussian` examples.
+
 Analyze checkpoints:
 
 ```bash
@@ -49,6 +59,13 @@ Interactive PCA and UMAP over the latest training run:
 ```bash
 python interactive_pca.py --task sin --method pca --device cuda
 python interactive_pca.py --task sin --method umap --device cuda
+```
+
+For a mixed model, condition the visualization on one function:
+
+```bash
+python interactive_pca.py --task all --condition_task sin --method pca --device cuda
+python interactive_pca.py --task all --condition_task sin --method umap --device cuda
 ```
 
 Both interactive plots include a training-step slider, hoverable `x` values,

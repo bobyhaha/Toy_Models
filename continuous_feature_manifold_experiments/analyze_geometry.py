@@ -31,8 +31,13 @@ def load_model(ckpt_path, device):
     return model, ckpt
 
 @torch.no_grad()
-def collect_h(model, task, device, layer="resid_final", n_grid=1000, precision=3):
-    xs, ys, input_ids, last_pos = make_grid_prompts(task, n=n_grid, precision=precision)
+def collect_h(model, task, device, layer="resid_final", n_grid=1000, precision=3, condition_task=None):
+    xs, ys, input_ids, last_pos = make_grid_prompts(
+        task,
+        n=n_grid,
+        precision=precision,
+        condition_task=condition_task,
+    )
     input_ids = input_ids.to(device)
     last_pos = last_pos.to(device)
     all_h = []
@@ -82,16 +87,36 @@ def checkpoint_step(path):
     m = re.search(r"step_(\d+)\.pt", str(path))
     return int(m.group(1)) if m else -1
 
+
+def load_latest_run_id(ckpt_dir):
+    latest_path = ckpt_dir / "latest_run.txt"
+    if latest_path.exists():
+        return latest_path.read_text().strip() or None
+    return None
+
+
+def checkpoint_matches_run(path, run_id, device):
+    if run_id is None:
+        return True
+    ckpt = torch.load(path, map_location=device)
+    return ckpt.get("run_id") == run_id
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--task", type=str, default="sin")
+    parser.add_argument("--condition_task", type=str, default=None, help="Function label to condition on when --task all.")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--layer", type=str, default="resid_final")
     parser.add_argument("--n_grid", type=int, default=1000)
     args = parser.parse_args()
 
-    ckpts = sorted((Path("checkpoints") / args.task).glob("step_*.pt"), key=checkpoint_step)
+    ckpt_dir = Path("checkpoints") / args.task
+    run_id = load_latest_run_id(ckpt_dir)
+    ckpts = sorted(ckpt_dir.glob("step_*.pt"), key=checkpoint_step)
+    ckpts = [p for p in ckpts if checkpoint_matches_run(p, run_id, args.device)]
     out_dir = Path("plots") / args.task
+    if args.task == "all" and args.condition_task:
+        out_dir = out_dir / args.condition_task
     out_dir.mkdir(parents=True, exist_ok=True)
 
     rows = []
@@ -102,7 +127,15 @@ def main():
     for ckpt_path in ckpts:
         model, ckpt = load_model(ckpt_path, args.device)
         precision = ckpt["train_cfg"].get("precision", 3)
-        xs, ys, H = collect_h(model, args.task, args.device, args.layer, args.n_grid, precision)
+        xs, ys, H = collect_h(
+            model,
+            args.task,
+            args.device,
+            args.layer,
+            args.n_grid,
+            precision,
+            condition_task=args.condition_task,
+        )
         m = geometry_metrics(xs, ys, H)
         step = checkpoint_step(ckpt_path)
         rows.append({k: v for k, v in m.items() if k != "Z2"} | {"step": step})

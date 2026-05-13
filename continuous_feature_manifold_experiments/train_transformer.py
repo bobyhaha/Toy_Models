@@ -9,7 +9,7 @@ from tqdm import tqdm
 
 from config import ModelConfig, TrainConfig
 from tokenizer import CharTokenizer
-from data import ContinuousFunctionDataset, collate
+from data import TASKS, ContinuousFunctionDataset, collate
 from model import TinyTransformer
 
 @torch.no_grad()
@@ -20,24 +20,47 @@ def evaluate(model, loader, device):
     correct_tokens = 0
     exact_sequences = 0
     total_sequences = 0
+    per_task_correct = {task: 0 for task in TASKS}
+    per_task_tokens = {task: 0 for task in TASKS}
+    per_task_exact = {task: 0 for task in TASKS}
+    per_task_sequences = {task: 0 for task in TASKS}
     for batch in loader:
         input_ids = batch["input_ids"].to(device)
         labels = batch["labels"].to(device)
+        task_ids = batch["task_id"].to(device)
         logits = model(input_ids)
         loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), labels.reshape(-1), ignore_index=-100, reduction="sum")
         mask = labels != -100
         preds = logits.argmax(dim=-1)
+        correct_by_pos = (preds == labels) & mask
+        exact_by_seq = ((preds == labels) | ~mask).all(dim=1)
         n = mask.sum().item()
         total_loss += loss.item()
         total_tokens += n
-        correct_tokens += ((preds == labels) & mask).sum().item()
-        exact_sequences += (((preds == labels) | ~mask).all(dim=1)).sum().item()
+        correct_tokens += correct_by_pos.sum().item()
+        exact_sequences += exact_by_seq.sum().item()
         total_sequences += labels.size(0)
+        for task_id, task in enumerate(TASKS):
+            task_mask = task_ids == task_id
+            if not task_mask.any():
+                continue
+            per_task_correct[task] += correct_by_pos[task_mask].sum().item()
+            per_task_tokens[task] += mask[task_mask].sum().item()
+            per_task_exact[task] += exact_by_seq[task_mask].sum().item()
+            per_task_sequences[task] += task_mask.sum().item()
     model.train()
     return {
         "loss": total_loss / max(total_tokens, 1),
         "token_accuracy": correct_tokens / max(total_tokens, 1),
         "exact_match": exact_sequences / max(total_sequences, 1),
+        "per_task_token_accuracy": {
+            task: per_task_correct[task] / max(per_task_tokens[task], 1)
+            for task in TASKS
+        },
+        "per_task_exact_match": {
+            task: per_task_exact[task] / max(per_task_sequences[task], 1)
+            for task in TASKS
+        },
     }
 
 def save_checkpoint(path, model, optimizer, step, model_cfg, train_cfg, tokenizer, run_id):
@@ -72,7 +95,7 @@ def should_run_interval(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--task", type=str, default="sin", choices=["identity", "square", "sin", "gaussian"])
+    parser.add_argument("--task", type=str, default="sin", choices=TASKS + ["all"])
     parser.add_argument("--steps", type=int, default=20000)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=0)
@@ -141,6 +164,8 @@ def main():
                     "test_loss": float(test_metrics["loss"]),
                     "test_token_accuracy": float(test_metrics["token_accuracy"]),
                     "test_exact_match": float(test_metrics["exact_match"]),
+                    "per_task_token_accuracy": test_metrics["per_task_token_accuracy"],
+                    "per_task_exact_match": test_metrics["per_task_exact_match"],
                 }
                 with metrics_path.open("a") as f:
                     f.write(json.dumps(row) + "\n")

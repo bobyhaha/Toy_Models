@@ -32,12 +32,17 @@ def load_training_metrics(metrics_path, run_id=None):
     return sorted(rows, key=lambda r: r["step"])
 
 
-def accuracy_for_step(metrics, step):
+def accuracy_for_step(metrics, step, condition_task=None):
     if not metrics:
         return np.nan
 
     steps = np.array([m["step"] for m in metrics])
-    if "test_token_accuracy" in metrics[0]:
+    if condition_task and "per_task_token_accuracy" in metrics[0]:
+        values = np.array([
+            m["per_task_token_accuracy"].get(condition_task, np.nan)
+            for m in metrics
+        ], dtype=float)
+    elif "test_token_accuracy" in metrics[0]:
         values = np.array([m["test_token_accuracy"] for m in metrics], dtype=float)
     elif "test_exact_match" in metrics[0]:
         values = np.array([m["test_exact_match"] for m in metrics], dtype=float)
@@ -86,6 +91,7 @@ def cluster_strength(Z, labels):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--task", type=str, default="sin")
+    parser.add_argument("--condition_task", type=str, default=None, help="Function label to condition on when --task all.")
     parser.add_argument("--checkpoint_dir", type=str, default=None)
     parser.add_argument("--run_id", type=str, default=None, help="Run id to analyze; defaults to latest_run.txt when present.")
     parser.add_argument("--layer", type=str, default="resid_final")
@@ -117,6 +123,7 @@ def main():
             layer=args.layer,
             n_grid=args.n_grid,
             precision=precision,
+            condition_task=args.condition_task,
         )
         Z, previous_components, evr = pca_frame(H, previous_components)
         labels = x_bin_labels(xs, args.n_bins)
@@ -129,7 +136,7 @@ def main():
                 "run_id": run_id,
                 "step": step,
                 "cluster_strength": cluster_strength(Z, labels),
-                "test_token_accuracy": accuracy_for_step(metrics, step),
+                "test_token_accuracy": accuracy_for_step(metrics, step, args.condition_task),
                 "pca_ev_1": float(evr[0]),
                 "pca_ev_2": float(evr[1]),
                 "pca_ev_3": float(evr[2]),
@@ -139,7 +146,8 @@ def main():
     out_dir = Path("plots") / args.task
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    out_jsonl = out_dir / "experiment_1_cluster_accuracy.jsonl"
+    suffix = f"_{args.condition_task}" if args.task == "all" and args.condition_task else ""
+    out_jsonl = out_dir / f"experiment_1_cluster_accuracy{suffix}.jsonl"
     with out_jsonl.open("w") as f:
         for row in rows:
             f.write(json.dumps(row) + "\n")
@@ -164,11 +172,12 @@ def main():
 
     lines = line1 + line2
     ax1.legend(lines, [line.get_label() for line in lines], loc="best")
-    ax1.set_title(f"Experiment 1 - {args.task}: Cluster Formation vs Accuracy")
+    title_task = f"all conditioned on {args.condition_task}" if args.task == "all" and args.condition_task else args.task
+    ax1.set_title(f"Experiment 1 - {title_task}: Cluster Formation vs Accuracy")
     ax1.grid(alpha=0.25)
     fig.tight_layout()
 
-    out_png = out_dir / "experiment_1_cluster_accuracy.png"
+    out_png = out_dir / f"experiment_1_cluster_accuracy{suffix}.png"
     fig.savefig(out_png, dpi=180)
     plt.close(fig)
 

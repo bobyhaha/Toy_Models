@@ -40,12 +40,17 @@ def load_training_metrics(metrics_path, run_id=None):
     return sorted(rows, key=lambda r: r["step"])
 
 
-def accuracy_for_step(metrics, step):
+def accuracy_for_step(metrics, step, condition_task=None):
     if not metrics:
         return np.nan
 
     steps = np.array([m["step"] for m in metrics])
-    if "test_token_accuracy" in metrics[0]:
+    if condition_task and "per_task_token_accuracy" in metrics[0]:
+        values = np.array([
+            m["per_task_token_accuracy"].get(condition_task, np.nan)
+            for m in metrics
+        ], dtype=float)
+    elif "test_token_accuracy" in metrics[0]:
         values = np.array([m["test_token_accuracy"] for m in metrics], dtype=float)
     elif "test_exact_match" in metrics[0]:
         values = np.array([m["test_exact_match"] for m in metrics], dtype=float)
@@ -88,8 +93,13 @@ def load_model(ckpt_path, device):
 
 
 @torch.no_grad()
-def collect_h(model, task, device, layer="resid_final", n_grid=1000, precision=3):
-    xs, ys, input_ids, last_pos = make_grid_prompts(task, n=n_grid, precision=precision)
+def collect_h(model, task, device, layer="resid_final", n_grid=1000, precision=3, condition_task=None):
+    xs, ys, input_ids, last_pos = make_grid_prompts(
+        task,
+        n=n_grid,
+        precision=precision,
+        condition_task=condition_task,
+    )
     input_ids = input_ids.to(device)
     last_pos = last_pos.to(device)
     all_h = []
@@ -209,6 +219,7 @@ def make_trace(Z, xs, ys, step, accuracy, neighbor_text, method, visible=True):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--task", type=str, default="sin")
+    parser.add_argument("--condition_task", type=str, default=None, help="Function label to condition on when --task all.")
     parser.add_argument("--checkpoint", type=str, default=None, help="Optional single checkpoint to plot.")
     parser.add_argument("--checkpoint_dir", type=str, default=None, help="Directory containing step_*.pt checkpoints.")
     parser.add_argument("--run_id", type=str, default=None, help="Checkpoint run id to plot; defaults to latest_run.txt when present.")
@@ -260,6 +271,7 @@ def main():
             layer=args.layer,
             n_grid=args.n_grid,
             precision=precision,
+            condition_task=args.condition_task,
         )
 
         step = checkpoint_step(ckpt_path)
@@ -274,7 +286,7 @@ def main():
             random_state=args.umap_random_state,
         )
         neighbor_text, neighbor_idx = nearest_neighbor_summaries(H, xs, args.knn)
-        accuracy = accuracy_for_step(metrics, step)
+        accuracy = accuracy_for_step(metrics, step, args.condition_task)
         frame_data.append({
             "step": step,
             "xs": xs,
@@ -316,7 +328,7 @@ def main():
                     )
                 ],
                 name=str(d["step"]),
-                layout={"title": frame_title(args.task, d, args.method)},
+                layout={"title": frame_title(display_task(args.task, args.condition_task), d, args.method)},
             )
             for d in frame_data
         ],
@@ -351,7 +363,7 @@ def main():
     z_range = [global_min[2] - axis_padding[2], global_max[2] + axis_padding[2]]
     axis1, axis2, axis3 = projection_axis_labels(args.method)
     fig.update_layout(
-        title=frame_title(args.task, first, args.method),
+        title=frame_title(display_task(args.task, args.condition_task), first, args.method),
         scene={
             "xaxis": {"title": axis1, "range": x_range},
             "yaxis": {"title": axis2, "range": y_range},
@@ -400,7 +412,8 @@ def main():
 
     out_dir = Path("plots") / args.task
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_name = f"interactive_{args.method}.html"
+    suffix = f"_{args.condition_task}" if args.task == "all" and args.condition_task else ""
+    out_name = f"interactive_{args.method}{suffix}.html"
     out_path = Path(args.output) if args.output else out_dir / out_name
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.write_html(out_path)
@@ -413,6 +426,12 @@ def projection_axis_labels(method):
     if method == "umap":
         return "UMAP1", "UMAP2", "UMAP3"
     raise ValueError(f"Unknown projection method: {method}")
+
+
+def display_task(task, condition_task=None):
+    if task == "all" and condition_task:
+        return f"all conditioned on {condition_task}"
+    return task
 
 
 def frame_title(task, frame, method):

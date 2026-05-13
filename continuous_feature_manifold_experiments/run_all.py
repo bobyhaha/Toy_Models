@@ -27,3 +27,15 @@ for task in TASKS:
     sae = f"checkpoints/{task}_sae_step_10000.pt"
     print(f"=== Analyzing SAE {task} ===")
     run(["analyze_sae.py", "--task", task, "--checkpoint", ckpt, "--sae", sae])
+
+print("=== Training all-task model ===")
+run(["train_transformer.py", "--task", "all", "--steps", "10000"])
+for condition_task in TASKS:
+    print(f"=== Analyzing all-task geometry conditioned on {condition_task} ===")
+    run(["analyze_geometry.py", "--task", "all", "--condition_task", condition_task])
+    print(f"=== Writing all-task interactive PCA conditioned on {condition_task} ===")
+    run(["interactive_pca.py", "--task", "all", "--condition_task", condition_task, "--method", "pca"])
+    print(f"=== Writing all-task interactive UMAP conditioned on {condition_task} ===")
+    run(["interactive_pca.py", "--task", "all", "--condition_task", condition_task, "--method", "umap"])
+    print(f"=== Comparing all-task clusters and accuracy conditioned on {condition_task} ===")
+    run(["compare_cluster_accuracy.py", "--task", "all", "--condition_task", condition_task])

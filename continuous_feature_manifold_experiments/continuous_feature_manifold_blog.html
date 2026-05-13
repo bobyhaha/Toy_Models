@@ -1,0 +1,457 @@
+---
+title: "Continuous Feature Manifolds in Tiny Transformers"
+---
+
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Continuous Feature Manifolds in Tiny Transformers</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #171717;
+      --muted: #5f6368;
+      --line: #d9dee3;
+      --soft: #f6f8fa;
+      --accent: #0f766e;
+      --accent-2: #7c2d12;
+      --link: #155e75;
+    }
+
+    body {
+      margin: 0;
+      font-family: ui-serif, Georgia, Cambria, "Times New Roman", Times, serif;
+      color: var(--ink);
+      background: #ffffff;
+      line-height: 1.62;
+    }
+
+    main {
+      max-width: 880px;
+      margin: 0 auto;
+      padding: 56px 22px 80px;
+    }
+
+    header {
+      border-bottom: 1px solid var(--line);
+      padding-bottom: 28px;
+      margin-bottom: 34px;
+    }
+
+    .eyebrow {
+      margin: 0 0 10px;
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 0.82rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--accent);
+      font-weight: 700;
+    }
+
+    h1, h2, h3 {
+      line-height: 1.15;
+      margin: 0;
+    }
+
+    h1 {
+      font-size: clamp(2.1rem, 7vw, 4.4rem);
+      max-width: 760px;
+      letter-spacing: 0;
+    }
+
+    h2 {
+      font-size: 1.65rem;
+      margin-top: 42px;
+      margin-bottom: 14px;
+    }
+
+    h3 {
+      font-size: 1.12rem;
+      margin-top: 24px;
+      margin-bottom: 8px;
+      color: var(--accent-2);
+    }
+
+    p {
+      margin: 14px 0;
+      font-size: 1.05rem;
+    }
+
+    a {
+      color: var(--link);
+      text-decoration-thickness: 1px;
+      text-underline-offset: 3px;
+    }
+
+    .lede {
+      max-width: 760px;
+      color: #303236;
+      font-size: 1.18rem;
+      margin-top: 20px;
+    }
+
+    blockquote {
+      margin: 28px 0;
+      padding: 16px 20px;
+      border-left: 4px solid var(--accent);
+      background: var(--soft);
+      color: #2b2d31;
+    }
+
+    code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+      font-size: 0.92em;
+      background: var(--soft);
+      padding: 0.12em 0.32em;
+      border-radius: 4px;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 22px 0 28px;
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 0.92rem;
+    }
+
+    th, td {
+      border-bottom: 1px solid var(--line);
+      padding: 10px 8px;
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      color: #34373b;
+      background: var(--soft);
+      font-weight: 700;
+    }
+
+    figure {
+      margin: 30px 0;
+    }
+
+    img {
+      display: block;
+      width: 100%;
+      height: auto;
+      border: 1px solid var(--line);
+      background: var(--soft);
+    }
+
+    figcaption {
+      margin-top: 8px;
+      color: var(--muted);
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 0.9rem;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 18px;
+      margin: 22px 0;
+    }
+
+    .card {
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 14px 16px;
+      background: #fff;
+    }
+
+    .card p {
+      margin: 8px 0 0;
+      color: var(--muted);
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 0.95rem;
+    }
+
+    .links {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+      padding: 0;
+      margin: 18px 0;
+      list-style: none;
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    .links a {
+      display: block;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 10px 12px;
+      background: var(--soft);
+      text-decoration: none;
+    }
+
+    .note {
+      color: var(--muted);
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 0.95rem;
+    }
+
+    @media (max-width: 720px) {
+      main {
+        padding-top: 36px;
+      }
+
+      .grid,
+      .links {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <p class="eyebrow">Experiment 1 / Mechanistic Interpretability</p>
+      <h1>Continuous Feature Manifolds in Tiny Transformers</h1>
+      <p class="lede">
+        These notes are about a small question with a surprisingly geometric flavor:
+        when a transformer learns a continuous function from decimal strings, does its
+        residual stream become a smooth internal manifold of the input variable?
+      </p>
+    </header>
+
+    <p>
+      The model here is intentionally small. It receives prompts such as
+      <code>x=1.234;y=</code> and is trained to emit the decimal expansion of a target
+      function. The four functions are <code>identity</code>, <code>square</code>,
+      <code>sin</code>, and <code>gaussian</code>. At different training checkpoints, I
+      collect the residual stream vector at the position just before the model begins
+      writing <code>y</code>. That vector is the object of study.
+    </p>
+
+    <blockquote>
+      The core picture is simple: if the model has learned a continuous function, then
+      nearby input values should have nearby internal states. The residual stream should
+      not just memorize strings. It should trace something like a curve or folded sheet.
+    </blockquote>
+
+    <h2>Experimental Setup</h2>
+    <p>
+      For each task, the model is trained on decimal-string regression. During analysis,
+      I sample a grid of input values, run the prompts through the model, and collect
+      <code>h(x)</code>, the residual stream activation before the target is generated.
+      I then visualize these activations with PCA, measure geometry statistics, and
+      compare a coarse cluster-formation score against token accuracy.
+    </p>
+
+    <div class="grid">
+      <div class="card">
+        <h3>Representation</h3>
+        <p>Residual stream activations at the final prompt position before generating <code>y</code>.</p>
+      </div>
+      <div class="card">
+        <h3>Geometry</h3>
+        <p>PCA projections, participation ratio, local smoothness, and distance correlations.</p>
+      </div>
+      <div class="card">
+        <h3>Dynamics</h3>
+        <p>Checkpoints were analyzed across training, with finer sampling early in training.</p>
+      </div>
+      <div class="card">
+        <h3>Accuracy</h3>
+        <p>Cluster formation was compared against test token accuracy for the same checkpoints.</p>
+      </div>
+    </div>
+
+    <h2>Headline Findings</h2>
+    <p>
+      The strongest result is temporal: accuracy rises very quickly. For several tasks,
+      most of the learning visible in token accuracy happens in the first 500 steps.
+      This motivated the denser checkpoint schedule now used by the experiment code.
+    </p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Task</th>
+          <th>Accuracy at step 1</th>
+          <th>Accuracy near step 500</th>
+          <th>Final accuracy</th>
+          <th>Final cluster score</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>identity</td>
+          <td>2.8%</td>
+          <td>100.0%</td>
+          <td>100.0%</td>
+          <td>0.193</td>
+        </tr>
+        <tr>
+          <td>square</td>
+          <td>5.3%</td>
+          <td>74.6%</td>
+          <td>89.2%</td>
+          <td>-0.073</td>
+        </tr>
+        <tr>
+          <td>sin</td>
+          <td>3.9%</td>
+          <td>84.0%</td>
+          <td>97.1%</td>
+          <td>-0.067</td>
+        </tr>
+        <tr>
+          <td>gaussian</td>
+          <td>6.2%</td>
+          <td>90.0%</td>
+          <td>98.4%</td>
+          <td>-0.093</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>
+      The cluster score here is an <code>x</code>-bin silhouette score in the projected
+      representation space. It is a deliberately crude measurement. It asks whether
+      coarse intervals of <code>x</code> separate into clusters. The answer is not
+      uniformly yes, and that is interesting.
+    </p>
+
+    <h2>Accuracy Is Fast, Geometry Is Slower</h2>
+    <p>
+      The identity task reaches perfect token accuracy by step 500, and its final
+      cluster score is positive. The gaussian task has a visible early cluster peak
+      around step 100, but by the final checkpoint its coarse silhouette score is
+      negative. The square and sine tasks also end with negative coarse cluster scores,
+      even though accuracy becomes high.
+    </p>
+
+    <figure>
+      <img src="plots/sin/experiment_1_cluster_accuracy.png" alt="Cluster formation versus accuracy for the sine task">
+      <figcaption>
+        Sine: accuracy rises early, while the x-bin cluster score does not simply track
+        accuracy. This suggests that learning the function and forming coarse separated
+        x-regions are different phenomena.
+      </figcaption>
+    </figure>
+
+    <figure>
+      <img src="plots/gaussian/experiment_1_cluster_accuracy.png" alt="Cluster formation versus accuracy for the gaussian task">
+      <figcaption>
+        Gaussian: an early cluster-strength peak appears before the final high-accuracy
+        state. This is a useful warning that representation geometry can transiently
+        sharpen and then reorganize.
+      </figcaption>
+    </figure>
+
+    <h2>Manifold, Not Just Clusters</h2>
+    <p>
+      My current interpretation is that "cluster formation" is too blunt a picture.
+      For a continuous variable, a successful representation may be better described as
+      an ordered manifold than as a set of separated islands. A negative silhouette
+      score does not mean the representation is meaningless. It can mean that adjacent
+      <code>x</code>-bins overlap smoothly, which is exactly what a continuous curve
+      should do.
+    </p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Task</th>
+          <th>Initial Spearman distance correlation with x</th>
+          <th>Final Spearman distance correlation with x</th>
+          <th>Final PCA participation ratio</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>identity</td>
+          <td>0.636</td>
+          <td>0.430</td>
+          <td>2.89</td>
+        </tr>
+        <tr>
+          <td>square</td>
+          <td>0.638</td>
+          <td>0.228</td>
+          <td>7.42</td>
+        </tr>
+        <tr>
+          <td>sin</td>
+          <td>0.640</td>
+          <td>0.626</td>
+          <td>1.87</td>
+        </tr>
+        <tr>
+          <td>gaussian</td>
+          <td>0.641</td>
+          <td>0.319</td>
+          <td>5.50</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>
+      The sine task is the cleanest manifold story in these metrics: the final
+      representation preserves a strong distance relationship with <code>x</code> and
+      remains low dimensional by PCA participation ratio. The square and gaussian tasks
+      seem to use higher-dimensional or more folded representations. That makes sense:
+      both are symmetric around zero, so the model may have less reason to preserve
+      signed distance in a simple one-dimensional order.
+    </p>
+
+    <h2>Interactive Visualizations</h2>
+    <p>
+      The most useful artifacts are the interactive PCA plots. They let you scrub
+      through checkpoint time, hover over individual points, and inspect which
+      <code>x</code> value each point corresponds to.
+    </p>
+
+    <ul class="links">
+      <li><a href="plots/identity/interactive_pca.html">Identity interactive PCA</a></li>
+      <li><a href="plots/square/interactive_pca.html">Square interactive PCA</a></li>
+      <li><a href="plots/sin/interactive_pca.html">Sine interactive PCA</a></li>
+      <li><a href="plots/gaussian/interactive_pca.html">Gaussian interactive PCA</a></li>
+    </ul>
+
+    <p class="note">
+      The code now also supports interactive UMAP with nearest-neighbor hover summaries
+      and per-step accuracy display. Those UMAP files will appear after rerunning the
+      updated analysis with <code>umap-learn</code> installed.
+    </p>
+
+    <h2>What Changed After Looking At The Results</h2>
+    <p>
+      The early accuracy jump changed the experiment design. The new checkpoint schedule
+      samples more densely where the transition is sharp: every 10 steps through step
+      500, every 50 steps through step 2500, and every 100 steps afterward. This is a
+      small practical point, but it matters: if the representational phase transition
+      happens early, coarse checkpointing can miss the actual event.
+    </p>
+
+    <p>
+      I also added a mixed-task model. Instead of training four separate transformers,
+      the new mode trains one model on all four tasks at once, using a task label in the
+      prompt. The question is whether the model builds one shared continuous coordinate
+      system for <code>x</code>, four separate task-conditioned manifolds, or something
+      in between.
+    </p>
+
+    <h2>Current Picture</h2>
+    <p>
+      My working picture is this: small transformers can learn continuous structure
+      from string supervision, but the resulting geometry is not merely a cartoon of
+      clusters forming. Accuracy can become high before the geometry settles. Some
+      functions preserve a clean low-dimensional order; others bend, fold, or spread
+      into higher-dimensional regions.
+    </p>
+
+    <p>
+      That feels like the beginning of a better question. Not "does the model have a
+      feature for <code>x</code>?" but rather: what kind of coordinate system does the
+      model invent, and how does that coordinate system depend on the function it is
+      trying to compute?
+    </p>
+  </main>
+</body>
+</html>
