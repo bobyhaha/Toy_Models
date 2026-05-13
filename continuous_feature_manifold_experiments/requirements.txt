@@ -5,3 +5,4 @@ plotly
 scikit-learn
 scipy
 tqdm
+umap-learn

@@ -1,4 +1,5 @@
 import argparse
+import json
 from pathlib import Path
 import re
 
@@ -21,6 +22,37 @@ def select_checkpoints(paths, max_checkpoints):
         return paths
     idx = np.linspace(0, len(paths) - 1, max_checkpoints).round().astype(int)
     return [paths[i] for i in sorted(set(idx))]
+
+
+def load_training_metrics(metrics_path, run_id=None):
+    rows = []
+    if not metrics_path.exists():
+        return rows
+
+    with metrics_path.open() as f:
+        for line in f:
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            if run_id is not None and row.get("run_id") != run_id:
+                continue
+            rows.append(row)
+    return sorted(rows, key=lambda r: r["step"])
+
+
+def accuracy_for_step(metrics, step):
+    if not metrics:
+        return np.nan
+
+    steps = np.array([m["step"] for m in metrics])
+    if "test_token_accuracy" in metrics[0]:
+        values = np.array([m["test_token_accuracy"] for m in metrics], dtype=float)
+    elif "test_exact_match" in metrics[0]:
+        values = np.array([m["test_exact_match"] for m in metrics], dtype=float)
+    else:
+        values = np.exp(-np.array([m["test_loss"] for m in metrics], dtype=float))
+
+    return float(values[np.argmin(np.abs(steps - step))])
 
 
 def load_latest_run_id(ckpt_dir):
@@ -95,8 +127,58 @@ def pca_frame(H, previous_components=None):
     return Z, components, explained_variance_ratio
 
 
-def make_trace(Z, xs, ys, step, visible=True):
-    customdata = np.column_stack([xs, ys])
+def umap_frame(H, n_neighbors=15, min_dist=0.1, random_state=0):
+    try:
+        import umap
+    except ImportError as exc:
+        raise ImportError(
+            "UMAP visualization requires the umap-learn package. "
+            "Install it with: pip install umap-learn"
+        ) from exc
+
+    reducer = umap.UMAP(
+        n_components=3,
+        n_neighbors=n_neighbors,
+        min_dist=min_dist,
+        metric="euclidean",
+        random_state=random_state,
+    )
+    Z = reducer.fit_transform(H)
+    return Z, np.array([np.nan, np.nan, np.nan])
+
+
+def project_frame(H, method, previous_components=None, umap_neighbors=15, umap_min_dist=0.1, random_state=0):
+    if method == "pca":
+        return pca_frame(H, previous_components)
+    if method == "umap":
+        Z, evr = umap_frame(H, umap_neighbors, umap_min_dist, random_state)
+        return Z, previous_components, evr
+    raise ValueError(f"Unknown projection method: {method}")
+
+
+def nearest_neighbor_summaries(H, xs, k):
+    if k <= 0:
+        return np.array([""] * len(xs), dtype=object), np.empty((len(xs), 0), dtype=int)
+
+    diff = H[:, None, :] - H[None, :, :]
+    distances = np.sqrt(np.sum(diff * diff, axis=-1))
+    np.fill_diagonal(distances, np.inf)
+    neighbor_idx = np.argsort(distances, axis=1)[:, :k]
+    summaries = []
+    for i, row in enumerate(neighbor_idx):
+        parts = [f"x={xs[j]:.6g} (d={distances[i, j]:.3g})" for j in row]
+        summaries.append("<br>".join(parts))
+    return np.array(summaries, dtype=object), neighbor_idx
+
+
+def make_trace(Z, xs, ys, step, accuracy, neighbor_text, method, visible=True):
+    customdata = np.column_stack([
+        xs,
+        ys,
+        np.full(len(xs), accuracy),
+        neighbor_text,
+    ])
+    axis1, axis2, axis3 = projection_axis_labels(method)
     return go.Scatter3d(
         x=Z[:, 0],
         y=Z[:, 1],
@@ -113,9 +195,11 @@ def make_trace(Z, xs, ys, step, visible=True):
         hovertemplate=(
             "x = %{customdata[0]:.6g}<br>"
             "y = %{customdata[1]:.6g}<br>"
-            "PC1 = %{x:.6g}<br>"
-            "PC2 = %{y:.6g}<br>"
-            "PC3 = %{z:.6g}"
+            "accuracy = %{customdata[2]:.3%}<br>"
+            f"{axis1} = %{{x:.6g}}<br>"
+            f"{axis2} = %{{y:.6g}}<br>"
+            f"{axis3} = %{{z:.6g}}<br>"
+            "nearest neighbors:<br>%{customdata[3]}"
             f"<extra>step {step}</extra>"
         ),
         name=f"step {step}",
@@ -128,15 +212,22 @@ def main():
     parser.add_argument("--checkpoint", type=str, default=None, help="Optional single checkpoint to plot.")
     parser.add_argument("--checkpoint_dir", type=str, default=None, help="Directory containing step_*.pt checkpoints.")
     parser.add_argument("--run_id", type=str, default=None, help="Checkpoint run id to plot; defaults to latest_run.txt when present.")
+    parser.add_argument("--method", type=str, default="pca", choices=["pca", "umap"])
     parser.add_argument("--max_checkpoints", type=int, default=0, help="Subsample to at most this many checkpoints; 0 means all.")
     parser.add_argument("--layer", type=str, default="resid_final")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--n_grid", type=int, default=1000)
+    parser.add_argument("--knn", type=int, default=5, help="Number of nearest neighbors to show on hover.")
+    parser.add_argument("--umap_neighbors", type=int, default=15)
+    parser.add_argument("--umap_min_dist", type=float, default=0.1)
+    parser.add_argument("--umap_random_state", type=int, default=0)
     parser.add_argument("--output", type=str, default=None)
     args = parser.parse_args()
 
+    ckpt_dir = None
     if args.checkpoint:
         ckpt_paths = [Path(args.checkpoint)]
+        run_id = args.run_id
     else:
         ckpt_dir = Path(args.checkpoint_dir) if args.checkpoint_dir else Path("checkpoints") / args.task
         run_id = args.run_id or load_latest_run_id(ckpt_dir)
@@ -148,6 +239,10 @@ def main():
         raise FileNotFoundError(
             f"No checkpoints found. Pass --checkpoint or put step_*.pt files under checkpoints/{args.task}."
         )
+
+    if ckpt_dir is None:
+        ckpt_dir = ckpt_paths[0].parent
+    metrics = load_training_metrics(ckpt_dir / "metrics.jsonl", run_id)
 
     frame_data = []
     previous_components = None
@@ -167,22 +262,61 @@ def main():
             precision=precision,
         )
 
-        Z, previous_components, evr = pca_frame(H, previous_components)
         step = checkpoint_step(ckpt_path)
         if step < 0:
             step = ckpt.get("step", len(frame_data))
-        frame_data.append({"step": step, "xs": xs, "ys": ys, "Z": Z, "evr": evr})
+        Z, previous_components, evr = project_frame(
+            H,
+            args.method,
+            previous_components=previous_components,
+            umap_neighbors=args.umap_neighbors,
+            umap_min_dist=args.umap_min_dist,
+            random_state=args.umap_random_state,
+        )
+        neighbor_text, neighbor_idx = nearest_neighbor_summaries(H, xs, args.knn)
+        accuracy = accuracy_for_step(metrics, step)
+        frame_data.append({
+            "step": step,
+            "xs": xs,
+            "ys": ys,
+            "Z": Z,
+            "evr": evr,
+            "accuracy": accuracy,
+            "neighbor_text": neighbor_text,
+            "neighbor_idx": neighbor_idx,
+        })
         global_min = np.minimum(global_min, Z.min(axis=0))
         global_max = np.maximum(global_max, Z.max(axis=0))
 
     first = frame_data[0]
     fig = go.Figure(
-        data=[make_trace(first["Z"], first["xs"], first["ys"], first["step"])],
+        data=[
+            make_trace(
+                first["Z"],
+                first["xs"],
+                first["ys"],
+                first["step"],
+                first["accuracy"],
+                first["neighbor_text"],
+                args.method,
+            )
+        ],
         frames=[
             go.Frame(
-                data=[make_trace(d["Z"], d["xs"], d["ys"], d["step"], visible=False)],
+                data=[
+                    make_trace(
+                        d["Z"],
+                        d["xs"],
+                        d["ys"],
+                        d["step"],
+                        d["accuracy"],
+                        d["neighbor_text"],
+                        args.method,
+                        visible=False,
+                    )
+                ],
                 name=str(d["step"]),
-                layout={"title": frame_title(args.task, d)},
+                layout={"title": frame_title(args.task, d, args.method)},
             )
             for d in frame_data
         ],
@@ -215,12 +349,13 @@ def main():
     x_range = [global_min[0] - axis_padding[0], global_max[0] + axis_padding[0]]
     y_range = [global_min[1] - axis_padding[1], global_max[1] + axis_padding[1]]
     z_range = [global_min[2] - axis_padding[2], global_max[2] + axis_padding[2]]
+    axis1, axis2, axis3 = projection_axis_labels(args.method)
     fig.update_layout(
-        title=frame_title(args.task, first),
+        title=frame_title(args.task, first, args.method),
         scene={
-            "xaxis": {"title": "PC1", "range": x_range},
-            "yaxis": {"title": "PC2", "range": y_range},
-            "zaxis": {"title": "PC3", "range": z_range},
+            "xaxis": {"title": axis1, "range": x_range},
+            "yaxis": {"title": axis2, "range": y_range},
+            "zaxis": {"title": axis3, "range": z_range},
         },
         margin={"l": 0, "r": 0, "t": 70, "b": 0},
         sliders=sliders,
@@ -265,18 +400,30 @@ def main():
 
     out_dir = Path("plots") / args.task
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = Path(args.output) if args.output else out_dir / "interactive_pca.html"
+    out_name = f"interactive_{args.method}.html"
+    out_path = Path(args.output) if args.output else out_dir / out_name
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.write_html(out_path)
-    print(f"Saved interactive PCA over {len(frame_data)} checkpoint(s) to {out_path}")
+    print(f"Saved interactive {args.method.upper()} over {len(frame_data)} checkpoint(s) to {out_path}")
 
 
-def frame_title(task, frame):
+def projection_axis_labels(method):
+    if method == "pca":
+        return "PC1", "PC2", "PC3"
+    if method == "umap":
+        return "UMAP1", "UMAP2", "UMAP3"
+    raise ValueError(f"Unknown projection method: {method}")
+
+
+def frame_title(task, frame, method):
     evr = frame["evr"]
-    return (
-        f"Experiment 1 - {task}: interactive PCA of h(x), step {frame['step']} "
-        f"(explained variance: {evr[0]:.1%}, {evr[1]:.1%}, {evr[2]:.1%})"
-    )
+    accuracy = frame["accuracy"]
+    acc_text = "accuracy unavailable" if np.isnan(accuracy) else f"accuracy: {accuracy:.1%}"
+    if method == "pca":
+        detail = f"explained variance: {evr[0]:.1%}, {evr[1]:.1%}, {evr[2]:.1%}"
+    else:
+        detail = "3D UMAP projection"
+    return f"Experiment 1 - {task}: interactive {method.upper()} of h(x), step {frame['step']} ({acc_text}; {detail})"
 
 if __name__ == "__main__":
     main()

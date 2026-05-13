@@ -16,7 +16,9 @@ for task in TASKS:
     print(f"=== Analyzing geometry {task} ===")
     run(["analyze_geometry.py", "--task", task])
     print(f"=== Writing interactive PCA {task} ===")
-    run(["interactive_pca.py", "--task", task])
+    run(["interactive_pca.py", "--task", task, "--method", "pca"])
+    print(f"=== Writing interactive UMAP {task} ===")
+    run(["interactive_pca.py", "--task", task, "--method", "umap"])
     print(f"=== Comparing clusters and accuracy {task} ===")
     run(["compare_cluster_accuracy.py", "--task", task])
     ckpt = f"checkpoints/{task}/step_10000.pt"

@@ -21,7 +21,7 @@ Main analyses:
 ## Setup
 
 ```bash
-pip install torch numpy matplotlib scikit-learn tqdm
+pip install torch numpy matplotlib plotly scikit-learn scipy tqdm umap-learn
 ```
 
 ## Run
@@ -44,11 +44,15 @@ Analyze checkpoints:
 python analyze_geometry.py --task sin --device cuda
 ```
 
-Interactive PCA over the latest training run:
+Interactive PCA and UMAP over the latest training run:
 
 ```bash
-python interactive_pca.py --task sin --device cuda
+python interactive_pca.py --task sin --method pca --device cuda
+python interactive_pca.py --task sin --method umap --device cuda
 ```
+
+Both interactive plots include a training-step slider, hoverable `x` values,
+nearest-neighbor summaries, and the nearest logged test accuracy for that step.
 
 Compare Experiment 1 cluster formation against model accuracy:
 
