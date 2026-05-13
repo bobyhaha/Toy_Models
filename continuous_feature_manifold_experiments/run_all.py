@@ -4,6 +4,7 @@ from pathlib import Path
 
 TASKS = ["identity", "square", "sin", "gaussian"]
 BASE_DIR = Path(__file__).resolve().parent
+TRAIN_STEPS = 3000
 
 
 def run(args):
@@ -12,7 +13,7 @@ def run(args):
 
 for task in TASKS:
     print(f"=== Training {task} ===")
-    run(["train_transformer.py", "--task", task, "--steps", "10000"])
+    run(["train_transformer.py", "--task", task, "--steps", str(TRAIN_STEPS)])
     print(f"=== Analyzing geometry {task} ===")
     run(["analyze_geometry.py", "--task", task])
     print(f"=== Writing interactive PCA {task} ===")
@@ -21,15 +22,15 @@ for task in TASKS:
     run(["interactive_pca.py", "--task", task, "--method", "umap"])
     print(f"=== Comparing clusters and accuracy {task} ===")
     run(["compare_cluster_accuracy.py", "--task", task])
-    ckpt = f"checkpoints/{task}/step_10000.pt"
+    ckpt = f"checkpoints/{task}/step_{TRAIN_STEPS}.pt"
     print(f"=== Training SAE {task} ===")
     run(["train_sae.py", "--task", task, "--checkpoint", ckpt])
-    sae = f"checkpoints/{task}_sae_step_10000.pt"
+    sae = f"checkpoints/{task}_sae_step_{TRAIN_STEPS}.pt"
     print(f"=== Analyzing SAE {task} ===")
     run(["analyze_sae.py", "--task", task, "--checkpoint", ckpt, "--sae", sae])
 
 print("=== Training all-task model ===")
-run(["train_transformer.py", "--task", "all", "--steps", "10000"])
+run(["train_transformer.py", "--task", "all", "--steps", str(TRAIN_STEPS)])
 for condition_task in TASKS:
     print(f"=== Analyzing all-task geometry conditioned on {condition_task} ===")
     run(["analyze_geometry.py", "--task", "all", "--condition_task", condition_task])
