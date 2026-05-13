@@ -52,6 +52,24 @@ def save_checkpoint(path, model, optimizer, step, model_cfg, train_cfg, tokenize
         "vocab": tokenizer.itos,
     }, path)
 
+
+def should_run_interval(
+    step,
+    early_until,
+    early_every,
+    mid_until,
+    mid_every,
+    regular_every,
+):
+    if step == 1:
+        return True
+    if step <= early_until:
+        return step % early_every == 0
+    if step <= mid_until:
+        return step % mid_every == 0
+    return step % regular_every == 0
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--task", type=str, default="sin", choices=["identity", "square", "sin", "gaussian"])
@@ -106,7 +124,14 @@ def main():
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
-            if step % train_cfg.eval_every == 0 or step == 1:
+            if should_run_interval(
+                step,
+                train_cfg.early_steps,
+                train_cfg.early_eval_every,
+                train_cfg.mid_steps,
+                train_cfg.mid_eval_every,
+                train_cfg.eval_every,
+            ):
                 test_metrics = evaluate(model, test_loader, args.device)
                 row = {
                     "run_id": run_id,
@@ -124,7 +149,14 @@ def main():
                     f"test {test_metrics['loss']:.4f} acc {test_metrics['token_accuracy']:.3f}"
                 )
 
-            if step % train_cfg.save_every == 0 or step == 1:
+            if should_run_interval(
+                step,
+                train_cfg.early_steps,
+                train_cfg.early_save_every,
+                train_cfg.mid_steps,
+                train_cfg.mid_save_every,
+                train_cfg.save_every,
+            ):
                 save_checkpoint(out_dir / f"step_{step}.pt", model, optimizer, step, model_cfg, train_cfg, tok, run_id)
 
             pbar.update(1)

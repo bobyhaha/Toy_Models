@@ -17,6 +17,12 @@ class TrainConfig:
     steps: int = 20000
     eval_every: int = 500
     save_every: int = 100
+    early_eval_every: int = 10
+    early_save_every: int = 10
+    early_steps: int = 500
+    mid_eval_every: int = 50
+    mid_save_every: int = 50
+    mid_steps: int = 2500
     precision: int = 3
     x_min: float = -3.14159
     x_max: float = 3.14159

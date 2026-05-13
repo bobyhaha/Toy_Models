@@ -12,7 +12,7 @@ Tasks:
 
 Main analyses:
 - Train a small decoder-only transformer on decimal-string regression.
-- Save checkpoints during training every 100 steps.
+- Save checkpoints every 10 steps through step 500, every 50 steps through step 2500, then every 100 steps.
 - Collect residual stream activations at the position right before generating y.
 - Measure whether h(x) becomes smooth and low-dimensional over training.
 - Train sparse autoencoders on h(x).
