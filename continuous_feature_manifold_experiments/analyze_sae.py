@@ -4,6 +4,7 @@ import numpy as np
 import torch
 import matplotlib.pyplot as plt
 
+from checkpoint_io import load_checkpoint
 from analyze_geometry import load_model, collect_h
 from sae import SparseAutoencoder
 
@@ -24,7 +25,7 @@ def main():
     xs, ys, H = collect_h(model, args.task, args.device, args.layer, args.n_grid, precision)
     H = torch.tensor(H, dtype=torch.float32).to(args.device)
 
-    sae_ckpt = torch.load(args.sae, map_location=args.device)
+    sae_ckpt = load_checkpoint(args.sae, map_location=args.device)
     sae = SparseAutoencoder(sae_ckpt["d_in"], sae_ckpt["d_hidden"]).to(args.device)
     sae.load_state_dict(sae_ckpt["sae"])
     sae.eval()

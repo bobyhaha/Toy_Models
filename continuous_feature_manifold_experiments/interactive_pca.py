@@ -7,6 +7,7 @@ import numpy as np
 import plotly.graph_objects as go
 import torch
 
+from checkpoint_io import load_checkpoint
 from data import make_grid_prompts
 from model import TinyTransformer
 from tokenizer import CharTokenizer
@@ -70,12 +71,12 @@ def load_latest_run_id(ckpt_dir):
 def checkpoint_matches_run(path, run_id, device):
     if run_id is None:
         return True
-    ckpt = torch.load(path, map_location=device)
+    ckpt = load_checkpoint(path, map_location=device)
     return ckpt.get("run_id") == run_id
 
 
 def load_model(ckpt_path, device):
-    ckpt = torch.load(ckpt_path, map_location=device)
+    ckpt = load_checkpoint(ckpt_path, map_location=device)
     tok = CharTokenizer()
     cfg = ckpt["model_cfg"]
     model = TinyTransformer(
